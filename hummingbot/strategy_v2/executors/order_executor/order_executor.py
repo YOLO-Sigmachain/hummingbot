@@ -406,6 +406,18 @@ class OrderExecutor(ExecutorBase):
             self._widen_slippage_if_that_was_it(event.order_id)
             self.logger().error(f"Order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")
             self._current_retries += 1
+            # A swap whose submission may have reached the chain is never placed again:
+            # spending the retry budget stops the executor instead. It stops here, before
+            # the control loop's next tick, which would otherwise place the order again.
+            connector = self.connectors.get(self.config.connector_name)
+            reason = getattr(connector, "order_failure_reason", lambda _: None)(event.order_id)
+            if reason and "[code: SUBMIT_OUTCOME_UNKNOWN]" in reason:
+                self.logger().error(
+                    f"Order {event.order_id} may have been submitted ({reason}); not retrying. "
+                    "Check it on-chain before trading this intent again."
+                )
+                self._current_retries = self._max_retries + 1
+                self.evaluate_max_retries()
 
     def _widen_slippage_if_that_was_it(self, order_id: str):
         """Widen the tolerance for the next attempt when slippage is what failed.

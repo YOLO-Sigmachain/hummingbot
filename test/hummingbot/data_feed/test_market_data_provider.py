@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pandas as pd
 
+from hummingbot.client.settings import GATEWAY_CHAINS
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import PriceType
 from hummingbot.core.data_type.funding_info import FundingInfo
@@ -315,6 +316,61 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
         call_kwargs = mock_gateway_instance.get_price.call_args[1]
         self.assertEqual(call_kwargs['network'], 'ethereum-mainnet')
         # Verify price was set
+        mock_oracle_instance.set_price.assert_called_with("BTC-USDT", Decimal("50000"))
+
+    @patch('hummingbot.core.rate_oracle.rate_oracle.RateOracle.get_instance')
+    @patch('hummingbot.core.gateway.gateway_http_client.GatewayHttpClient.get_instance')
+    async def test_update_rates_task_gateway_chain_reported_by_gateway(self, mock_gateway_client, mock_rate_oracle):
+        # A chain Gateway serves from config alone, absent from the built-in Chain list, is
+        # priced through Gateway once Gateway has reported it.
+        mock_gateway_instance = AsyncMock()
+        mock_gateway_client.return_value = mock_gateway_instance
+        mock_gateway_instance.get_default_swap_provider.return_value = "exampledex/amm"
+        mock_gateway_instance.get_price.return_value = {"price": "0.0234"}
+        mock_oracle_instance = MagicMock()
+        mock_rate_oracle.return_value = mock_oracle_instance
+
+        connector_pair = ConnectorPair(connector_name="examplechain-mainnet", trading_pair="AAA-BBB")
+        self.provider._rates_required.add_or_update("examplechain-mainnet", connector_pair)
+
+        saved = list(GATEWAY_CHAINS)
+        GATEWAY_CHAINS[:] = ["ethereum", "solana", "examplechain"]
+        try:
+            with patch('asyncio.sleep', side_effect=asyncio.CancelledError()):
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.provider.update_rates_task()
+        finally:
+            GATEWAY_CHAINS[:] = saved
+
+        mock_gateway_instance.get_default_swap_provider.assert_called_with("examplechain-mainnet")
+        self.assertEqual("examplechain-mainnet", mock_gateway_instance.get_price.call_args[1]["network"])
+        mock_oracle_instance.set_price.assert_called_with("AAA-BBB", Decimal("0.0234"))
+
+    @patch('hummingbot.core.rate_oracle.rate_oracle.RateOracle.get_instance')
+    @patch('hummingbot.core.gateway.gateway_http_client.GatewayHttpClient.get_instance')
+    async def test_update_rates_task_exchange_named_like_a_gateway_chain(self, mock_gateway_client, mock_rate_oracle):
+        # A chain named like an exchange connector does not turn that exchange into a
+        # Gateway network: a Gateway network is "chain-network".
+        mock_gateway_instance = AsyncMock()
+        mock_gateway_client.return_value = mock_gateway_instance
+        mock_oracle_instance = MagicMock()
+        mock_rate_oracle.return_value = mock_oracle_instance
+        self.provider._non_trading_connectors["examplechain_perpetual"] = AsyncMock()
+
+        connector_pair = ConnectorPair(connector_name="examplechain_perpetual", trading_pair="BTC-USDT")
+        self.provider._rates_required.add_or_update("examplechain_perpetual", connector_pair)
+
+        saved = list(GATEWAY_CHAINS)
+        GATEWAY_CHAINS[:] = ["ethereum", "solana", "examplechain"]
+        try:
+            with patch.object(self.provider, '_safe_get_last_traded_prices', return_value={"BTC-USDT": Decimal("50000")}):
+                with patch('asyncio.sleep', side_effect=[None, asyncio.CancelledError()]):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await self.provider.update_rates_task()
+        finally:
+            GATEWAY_CHAINS[:] = saved
+
+        mock_gateway_instance.get_price.assert_not_called()
         mock_oracle_instance.set_price.assert_called_with("BTC-USDT", Decimal("50000"))
 
     @patch('hummingbot.core.rate_oracle.rate_oracle.RateOracle.get_instance')

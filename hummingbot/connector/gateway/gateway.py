@@ -11,12 +11,18 @@ Architecture:
 """
 
 import asyncio
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, localcontext
 from typing import Any, Dict, List, Optional, Union
 
+import aiohttp
 from pydantic import BaseModel, Field
 
-from hummingbot.connector.gateway.gateway_base import TX_DATA_UNAVAILABLE, GatewayBase, extract_error_code
+from hummingbot.connector.gateway.gateway_base import (
+    TX_DATA_UNAVAILABLE,
+    GatewayBase,
+    TransactionUnresolvedError,
+    extract_error_code,
+)
 from hummingbot.connector.gateway.gateway_in_flight_order import GatewayInFlightOrder
 from hummingbot.core.data_type.common import LPType, OrderType, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate, TradeUpdate
@@ -31,6 +37,10 @@ from hummingbot.core.gateway.gateway_error import GatewayError
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.core.utils import async_ttl_cache
 from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
+
+# AMM connectors whose execute-swap declares minAmountOut/maxAmountIn, and so binds the swap
+# to the price limit sent with it. Every other connector is sent none.
+PRICE_LIMIT_DEXES = frozenset({"ergodex"})
 
 
 class TokenInfo(BaseModel):
@@ -323,6 +333,16 @@ class Gateway(GatewayBase):
         safe_ensure_future(self._create_order(side, order_id, trading_pair, amount, price, **request_args))
         return order_id
 
+    def cancel(self, trading_pair: str, client_order_id: str):
+        """A swap cannot be cancelled once it is submitted: the order stays open until the chain resolves it."""
+        order = self._order_tracker.fetch_order(client_order_id)
+        transaction_hash = order.exchange_order_id if order is not None else None
+        self.logger().warning(
+            f"Swap orders cannot be cancelled; order {client_order_id} stays open on {transaction_hash} "
+            "until the chain resolves it."
+        )
+        return client_order_id
+
     async def _create_order(
             self,
             trade_type: TradeType,
@@ -359,6 +379,10 @@ class Gateway(GatewayBase):
                                       price=price,
                                       amount=amount)
 
+        # A network config that could not be read at start is read again here, so the swap
+        # follows its network's rules and provider once Gateway answers.
+        await self._ensure_network_timing_read()
+
         # Extract optional parameters
         quote_id = kwargs.get("quote_id")
         slippage_pct = kwargs.get("slippage_pct")
@@ -375,6 +399,13 @@ class Gateway(GatewayBase):
                 raise ValueError(f"No swap provider configured for {self.network}.")
 
             dex, trading_type = self._parse_dex_name(swap_provider)
+            # Only the AMM route takes a price limit; the router route refuses keys it does
+            # not declare. A stock Gateway's AMM route accepts and ignores them, so the limit
+            # is sent only to the connectors known to bind the swap to it.
+            price_limit = (
+                self._swap_price_limit(trade_type, trading_pair, amount, price, slippage_pct)
+                if trading_type == "amm" and not quote_id and dex in PRICE_LIMIT_DEXES else {}
+            )
 
             async def execute_gateway_swap() -> Dict[str, Any]:
                 if quote_id:
@@ -396,24 +427,184 @@ class Gateway(GatewayBase):
                         network=self.network,
                         chain=self.chain,
                         wallet_address=self.address,
-                        slippage_pct=slippage_pct
+                        slippage_pct=slippage_pct,
+                        **price_limit,
                     )
+
+            if not self._is_usable_price(price):
+                # A fill confirmed without Gateway's realized amounts is booked at the order's
+                # price, and this order has none. Quote one alongside the submission, which
+                # never waits for it; without a quote the fill is booked at price 0.
+                safe_ensure_future(self._set_quoted_price(order_id, trading_pair, trade_type, amount))
 
             order_result = await self._execute_with_retry(
                 operation=execute_gateway_swap,
                 operation_name=f"swap {trade_type.name} {amount} on {trading_pair}",
                 max_retries=max_retries,
+                # Where the transaction is never re-submitted, attach its hash as soon as it
+                # is broadcast, so the order is saved with it and polled by the status loop
+                # while it is still being waited for. Not where a re-submission can change
+                # the hash: the first one would stick to the order.
+                on_broadcast=(
+                    (lambda signature: self.update_order_from_hash(order_id, trading_pair, signature, {}))
+                    if not self.not_found_proves_dropped else None
+                ),
             )
 
             transaction_hash: Optional[str] = order_result.get("signature")
             if transaction_hash is not None and transaction_hash != "":
-                self.update_order_from_hash(order_id, trading_pair, transaction_hash, order_result)
+                if self._has_no_hash_yet(order_id):
+                    self.update_order_from_hash(order_id, trading_pair, transaction_hash, order_result)
                 self._store_swap_result(order_id, trade_type, trading_pair, amount, order_result, transaction_hash)
 
         except asyncio.CancelledError:
             raise
+        except TransactionUnresolvedError as e:
+            # Broadcast, and neither confirmed nor shown to have failed when polling
+            # stopped. That is no evidence of failure: the swap may still land, and
+            # failing the order here would leave its fill uncounted and invite the
+            # strategy to trade again. Keep the order open on its transaction instead;
+            # update_order_status() resolves it from the chain (CONFIRMED -> filled,
+            # FAILED -> failed). NOT_FOUND counts toward the lost-order rule only on a
+            # network where it proves the transaction can no longer land; elsewhere it
+            # keeps the order open.
+            self.logger().warning(
+                f"Swap order {order_id} on {trading_pair}: {e} Keeping the order open on transaction "
+                f"{e.signature} for status polling."
+            )
+            if self._has_no_hash_yet(order_id):
+                self.update_order_from_hash(order_id, trading_pair, e.signature, {})
+        except aiohttp.ClientConnectorError as e:
+            # The connection to Gateway could not be opened, so no request was sent.
+            self._fail_swap_order(order_id, trading_pair, trade_type, e)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            # The request failed on the way to or from Gateway, so whether Gateway submitted
+            # the swap is unknown. Where a transaction never expires, that order must not be
+            # traded again before someone checks the chain: the failure says so.
+            error = Exception(f"{e!r} [code: SUBMIT_OUTCOME_UNKNOWN]") if not self.not_found_proves_dropped else e
+            self._fail_swap_order(order_id, trading_pair, trade_type, error)
         except Exception as e:
-            self._handle_operation_failure(order_id, trading_pair, f"submitting {trade_type.name} swap order", e)
+            self._fail_swap_order(order_id, trading_pair, trade_type, e)
+
+    def _fail_swap_order(self, order_id: str, trading_pair: str, trade_type: TradeType, error: Exception):
+        """Fail the order, unless the order-status loop has already resolved it from the chain."""
+        if self._order_tracker.fetch_tracked_order(order_id) is None:
+            self.logger().warning(
+                f"Swap order {order_id}: order already resolved by the status loop; ignoring the late failure "
+                f"({error})."
+            )
+            return
+        self._handle_operation_failure(order_id, trading_pair, f"submitting {trade_type.name} swap order", error)
+
+    @staticmethod
+    def _is_usable_price(price: Optional[Decimal]) -> bool:
+        """Whether an order's price can book a fill: finite and positive (a market order's is NaN)."""
+        return price is not None and Decimal(str(price)).is_finite() and price > 0
+
+    async def _set_quoted_price(self, order_id: str, trading_pair: str, trade_type: TradeType, amount: Decimal):
+        """Give an open order placed without a usable price Gateway's quoted price, if Gateway gives one."""
+        try:
+            quoted = await self.get_quote_price(trading_pair, trade_type == TradeType.BUY, amount)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger().warning(f"Swap order {order_id}: no quote to book its fill at ({e}).")
+            return
+        tracked = self._order_tracker.fetch_tracked_order(order_id)
+        if self._is_usable_price(quoted) and tracked is not None and not tracked.is_done:
+            tracked.price = self.quantize_order_price(trading_pair, quoted)
+
+    def _has_no_hash_yet(self, order_id: str) -> bool:
+        """Whether the order is still open and has no transaction hash attached yet."""
+        tracked = self._order_tracker.fetch_tracked_order(order_id)
+        return tracked is not None and not tracked.is_done and tracked.exchange_order_id is None
+
+    # A JSON number holds a decimal exactly up to this many significant digits, so a limit
+    # with no more than this reaches Gateway as the value computed here.
+    PRICE_LIMIT_SIGNIFICANT_DIGITS = 15
+
+    def _swap_price_limit(
+        self,
+        trade_type: TradeType,
+        trading_pair: str,
+        amount: Decimal,
+        price: Decimal,
+        slippage_pct: Optional[Union[Decimal, float, str]],
+    ) -> Dict[str, Decimal]:
+        """The price limit for an AMM swap, as execute_swap keyword arguments.
+
+        buy() and sell() take a price the order may not do worse than. Gateway can bind it
+        on the swap it builds: a SELL must receive at least amount x price of the quote
+        token (`minAmountOut`), a BUY may spend at most amount x price of it
+        (`maxAmountIn`), each widened by the slippage tolerance the order was placed with
+        (none if it named none; Gateway then also applies its own on its own quote).
+
+        The exact product is first rounded to 15 significant digits, which removes the
+        noise a price read from a float carries beyond them. It is then rounded to the quote
+        token's decimals, and to 15 significant digits, in the direction that tightens it:
+        up for a SELL's minimum, down for a BUY's maximum. So it is never looser than the
+        order by more than half a unit in the 15th significant digit, and never finer than
+        the token or than a JSON number carries.
+
+        Returns {} (no limit) when the order has no usable price, e.g. a market order's NaN.
+        Raises ValueError, before anything is sent, when the quote token's decimals are
+        unknown, when the limit is below 1e-6 or 1e15 or more (Gateway cannot read such a JSON
+        number), or when a BUY's limit rounds to 0 of the quote token (no swap could pass it).
+        """
+        if price is None or amount is None:
+            return {}
+        price, amount = Decimal(str(price)), Decimal(str(amount))
+        if not price.is_finite() or not amount.is_finite() or price <= 0 or amount <= 0:
+            return {}
+        slippage = Decimal(str(slippage_pct)) if slippage_pct is not None else Decimal("0")
+        quote = trading_pair.split("-")[1]
+        decimals = self._token_decimals(quote)
+        if decimals is None:
+            raise ValueError(f"Cannot bind this swap's price: decimals of {quote} are unknown to the client")
+        with localcontext() as context:
+            # Exact products, so the roundings below are the only roundings.
+            context.prec = 100
+            if trade_type == TradeType.SELL:
+                limit = max(amount * price * (Decimal("100") - slippage) / Decimal("100"), Decimal("0"))
+                rounding, key = ROUND_CEILING, "min_amount_out"
+            else:
+                limit = amount * price * (Decimal("100") + slippage) / Decimal("100")
+                rounding, key = ROUND_FLOOR, "max_amount_in"
+            if limit != 0:
+                limit = limit.quantize(
+                    Decimal(1).scaleb(limit.adjusted() - (self.PRICE_LIMIT_SIGNIFICANT_DIGITS - 1)),
+                    rounding=ROUND_HALF_EVEN,
+                )
+        # The finest digit kept: the token's last decimal, or the 15th significant digit
+        # when that is coarser. One quantize, so the result never has more digits than that.
+        lowest_digit = max(-decimals, limit.adjusted() - (self.PRICE_LIMIT_SIGNIFICANT_DIGITS - 1))
+        limit = limit.quantize(Decimal(1).scaleb(lowest_digit), rounding=rounding)
+        if 0 < limit < Decimal("1e-6"):
+            raise ValueError("price limit below 1e-6 cannot be sent as a JSON number to this Gateway")
+        if limit >= Decimal("1e15"):
+            raise ValueError("price limit of 1e15 or more cannot be sent as a JSON number to this Gateway")
+        if key == "max_amount_in" and limit == 0:
+            raise ValueError(f"Cannot bind this swap's price: its quote value rounds to 0 {quote}")
+        return {key: limit}
+
+    def _token_decimals(self, symbol: str) -> Optional[int]:
+        """A token's decimals from Gateway's token list, or for the native coin, from the network config.
+
+        The token is looked up by its exact symbol, then by a symbol that differs only in
+        case (Gateway accepts either) if exactly one token has it, then by its address.
+        """
+        token = self._token_data.get(symbol)
+        if token is None:
+            matches = [t for s, t in self._token_data.items() if s.lower() == symbol.lower()]
+            token = matches[0] if len(matches) == 1 else None
+        if token is None:
+            token = self.get_token_by_address(symbol)
+        if token is not None and token.get("decimals") is not None:
+            return int(token["decimals"])
+        if (self._native_decimals is not None and self._native_currency is not None
+                and symbol.upper() == self._native_currency.upper()):
+            return self._native_decimals
+        return None
 
     def _store_swap_result(
         self,

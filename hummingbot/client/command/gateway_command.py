@@ -371,9 +371,15 @@ class GatewayCommand(GatewayChainApiManager):
             # Check specific chain
             chains_to_check = [chain_filter]
         else:
-            # Get all available chains from the Chain enum
-            from hummingbot.connector.gateway.common_types import Chain
-            chains_to_check = [chain.chain for chain in Chain]
+            # Every chain the client knows of, including those the running Gateway reports.
+            # Once Gateway has reported its chains, only those: a chain it does not serve has
+            # no network to list balances on.
+            from hummingbot.client.settings import GATEWAY_CHAINS
+            from hummingbot.connector.gateway.common_types import known_chains
+            chains_to_check = list(known_chains())
+            reported = {c.lower() for c in GATEWAY_CHAINS}
+            if reported:
+                chains_to_check = [c for c in chains_to_check if c in reported]
 
         # Process each chain
         for chain in chains_to_check:

@@ -4,12 +4,19 @@ from decimal import Decimal
 from typing import List
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from hummingbot.connector.gateway.gateway_base import TX_DATA_UNAVAILABLE, GatewayBase, RetryAction
+from hummingbot.connector.gateway import gateway_base
+from hummingbot.connector.gateway.gateway_base import (
+    TX_DATA_UNAVAILABLE,
+    GatewayBase,
+    RetryAction,
+    TransactionUnresolvedError,
+)
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
 from hummingbot.core.event.event_logger import EventLogger
 from hummingbot.core.event.events import BuyOrderCreatedEvent, MarketEvent, SellOrderCreatedEvent
+from hummingbot.core.gateway.gateway_error import GatewayError
 
 
 class MockGatewayConnector(GatewayBase):
@@ -30,6 +37,31 @@ class MockGatewayConnector(GatewayBase):
     @property
     def name(self) -> str:
         return self._name
+
+
+# The keys of a stock Solana network config that matter here: no block timing.
+STOCK_SOLANA_CONFIG = {"swapProvider": "jupiter/router", "nativeCurrencySymbol": "SOL"}
+
+
+def read_network_config_after_one_failure(connector: GatewayBase, run):
+    """Leave the connector as one whose first network config read failed and whose next one
+    succeeded, as after a start while Gateway was unreachable and a later status poll.
+
+    `run` runs a coroutine to completion on the test's event loop.
+    """
+    connector._network_timing_read = False  # as built: no network config read yet
+    connector._publishes_block_timing = False
+    gateway = MagicMock()
+    gateway.get_configuration = AsyncMock(side_effect=[asyncio.TimeoutError(), STOCK_SOLANA_CONFIG])
+    clock = MagicMock()
+    clock.time.return_value = 1000.0
+    with patch.object(gateway_base, "time", clock), patch.object(connector, "_get_gateway_instance", return_value=gateway):
+        run(connector.update_order_status([]))
+        assert not connector.not_found_proves_dropped
+        clock.time.return_value += connector.NETWORK_CONFIG_RETRY_INTERVAL
+        run(connector.update_order_status([]))
+    assert connector.not_found_proves_dropped
+    assert gateway.get_configuration.await_count == 2
 
 
 class GatewayBaseEventOrderingTest(unittest.TestCase):
@@ -449,6 +481,8 @@ class GatewayBaseResubmitReconciliationTest(unittest.TestCase):
         # Real value is 120s (it has to outlast a blockhash); the verdict logic is
         # identical at any deadline, so shrink it to keep the suite fast.
         self.connector.SIGNATURE_POLL_TIMEOUT = 0.05
+        # A stock Solana network config has been read: it publishes no block timing.
+        self.connector._read_network_timing({"nativeCurrencySymbol": "SOL"})
         self.submissions = 0
 
     def _patch_poll(self, results):
@@ -585,6 +619,70 @@ class GatewayBaseResubmitReconciliationTest(unittest.TestCase):
         self.assertEqual("timeout-sig", result["signature"])
         self.assertEqual(1, self.submissions)
 
+    def test_timeout_then_not_found_resubmits_once(self):
+        # Gateway's 504 names the transaction; it is still unknown to the cluster at the
+        # deadline, so its blockhash has expired and exactly one fresh submission is safe.
+        self._patch_poll([-2])
+
+        async def operation():
+            self.submissions += 1
+            if self.submissions == 1:
+                raise Exception(
+                    "Transaction timeout-sig was not confirmed before its blockhash expired. "
+                    "It most likely did not land [code: TRANSACTION_TIMEOUT]")
+            return {"signature": "sig-2", "status": 1}
+
+        result = asyncio.run(self.connector._execute_with_retry(
+            operation, "test swap", max_retries=10, retry_delay=0.0))
+        self.assertEqual("sig-2", result["signature"])
+        self.assertEqual(2, self.submissions)
+
+    def test_timeout_at_an_exhausted_budget_is_still_polled(self):
+        # No retries left (the LP close path passes max_retries=0), but the 504 names a
+        # broadcast transaction: it is polled, and found confirmed, before anything fails.
+        self._patch_poll([1])
+
+        async def operation():
+            self.submissions += 1
+            raise Exception(
+                "Transaction timeout-sig was not confirmed before its blockhash expired. "
+                "It most likely did not land [code: TRANSACTION_TIMEOUT]")
+
+        result = asyncio.run(self.connector._execute_with_retry(
+            operation, "test swap", max_retries=0, retry_delay=0.0))
+        self.assertEqual(1, result["status"])
+        self.assertEqual("timeout-sig", result["signature"])
+        self.assertEqual(1, self.submissions)
+
+    def test_timeout_not_found_at_an_exhausted_budget_is_not_resubmitted(self):
+        self._patch_poll([-2])
+
+        async def operation():
+            self.submissions += 1
+            raise Exception(
+                "Transaction timeout-sig was not confirmed before its blockhash expired. "
+                "It most likely did not land [code: TRANSACTION_TIMEOUT]")
+
+        with self.assertRaises(Exception):
+            asyncio.run(self.connector._execute_with_retry(
+                operation, "test swap", max_retries=0, retry_delay=0.0))
+        self.assertEqual(1, self.submissions)
+
+    def test_on_broadcast_is_given_the_signature_before_it_is_polled(self):
+        self._patch_poll([1])
+        broadcast = []
+
+        async def timeout_operation():
+            raise Exception(
+                "Transaction timeout-sig was not confirmed before its blockhash expired. "
+                "It most likely did not land [code: TRANSACTION_TIMEOUT]")
+
+        asyncio.run(self.connector._execute_with_retry(
+            self._pending_operation, "test swap", max_retries=10, on_broadcast=broadcast.append))
+        asyncio.run(self.connector._execute_with_retry(
+            timeout_operation, "test swap", max_retries=10, on_broadcast=broadcast.append))
+        self.assertEqual(["sig-1", "timeout-sig"], broadcast)
+
     def test_rate_limited_is_retryable(self):
         error = Exception("Gateway error: too many requests [code: RATE_LIMITED]")
         action = self.connector._classify_error(error, "execute swap", 0, 10)
@@ -644,6 +742,8 @@ class GatewayBaseNotFoundPollingTest(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self.connector = MockGatewayConnector()
+        # A stock Solana network config has been read: it publishes no block timing.
+        self.connector._read_network_timing({"nativeCurrencySymbol": "SOL"})
         self.start_timestamp = 1640000000.0
         self.connector._set_current_timestamp(self.start_timestamp)
         self.order_id = "test-not-found-order"
@@ -703,6 +803,359 @@ class GatewayBaseNotFoundPollingTest(unittest.TestCase):
         self._poll_with_status(0)
         self.assertEqual(0, self.connector._order_tracker._order_not_found_records[self.order_id])
         self.assertIn(self.order_id, self.connector._order_tracker.active_orders)
+
+    def test_not_found_never_counts_on_a_network_that_publishes_block_timing(self):
+        # There NOT_FOUND does not prove the transaction can no longer land, at any age:
+        # the order stays open, and the operator is warned once.
+        self.connector._read_network_timing({"blockTimeSeconds": 120, "confirmations": 1})
+        with patch.object(self.connector.logger(), "network") as network_log:
+            for age in (200.0, 721.0, 10000.0):
+                self.connector._set_current_timestamp(self.start_timestamp + age)
+                for _ in range(self.connector._order_tracker.lost_order_count_limit + 1):
+                    self._poll_with_status(-2)
+        self.assertEqual(0, self.connector._order_tracker._order_not_found_records[self.order_id])
+        self.assertIn(self.order_id, self.connector._order_tracker.active_orders)
+        self.assertEqual(1, network_log.call_count)
+
+    def test_not_found_is_warned_about_only_once_the_order_is_older_than_the_deadline(self):
+        # Right after submission not found is ordinary propagation lag.
+        self.connector._read_network_timing({"blockTimeSeconds": 120, "confirmations": 1})
+        with patch.object(self.connector.logger(), "network") as network_log:
+            self.connector._set_current_timestamp(self.start_timestamp + 10.0)
+            self._poll_with_status(-2)
+            self.assertEqual(0, network_log.call_count)
+            self.connector._set_current_timestamp(self.start_timestamp + 721.0)
+            self._poll_with_status(-2)
+            self.assertEqual(1, network_log.call_count)
+        self.assertIn(self.order_id, self.connector._order_tracker.active_orders)
+
+    def _warned_about_then_resolved(self, final_status: int):
+        self.connector._read_network_timing({"blockTimeSeconds": 120, "confirmations": 1})
+        self.connector._set_current_timestamp(self.start_timestamp + 721.0)
+        with patch.object(self.connector.logger(), "network"):
+            self._poll_with_status(-2)
+            self.assertIn(self.order_id, self.connector._unresolved_not_found_warned)
+            self._poll_with_status(final_status)
+
+    def test_a_confirmed_order_is_forgotten_by_the_not_found_warning(self):
+        self._warned_about_then_resolved(1)
+        self.assertNotIn(self.order_id, self.connector._unresolved_not_found_warned)
+
+    def test_a_failed_order_is_forgotten_by_the_not_found_warning(self):
+        self._warned_about_then_resolved(-1)
+        self.assertNotIn(self.order_id, self.connector._unresolved_not_found_warned)
+
+    def test_not_found_never_counts_before_the_network_config_is_read(self):
+        # A connector whose network config could not be read cannot tell which rule applies.
+        self.connector = MockGatewayConnector()
+        self.connector._set_current_timestamp(self.start_timestamp)
+        self.connector.start_tracking_order(
+            order_id=self.order_id, exchange_order_id=self.tx_hash, trading_pair="SOL-USDC",
+            trade_type=TradeType.BUY, price=Decimal("100"), amount=Decimal("1"),
+        )
+        self.connector._set_current_timestamp(self.start_timestamp + 10000.0)
+        for _ in range(self.connector._order_tracker.lost_order_count_limit + 1):
+            self._poll_with_status(-2)
+        self.assertIn(self.order_id, self.connector._order_tracker.active_orders)
+
+
+class GatewayBaseNetworkTimingTest(unittest.TestCase):
+    """How long a submitted transaction is waited for comes from the network's own config.
+
+    The fixed 120s waits are tuned to Solana's blockhash window. A network whose blocks
+    take minutes would rule swaps failed while they still confirm, so a network that
+    publishes `blockTimeSeconds` (and `confirmations`) waits for the blocks a confirmation
+    needs plus a margin. Networks that publish neither keep the fixed waits.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.connector = MockGatewayConnector()
+
+    def test_defaults_unchanged_when_the_network_publishes_no_block_timing(self):
+        # The keys a stock Solana or Ethereum network config carries.
+        self.connector._read_network_timing({
+            "nativeCurrencySymbol": "SOL", "swapProvider": "jupiter/router", "nodeURL": "https://example.invalid",
+        })
+        self.assertEqual(GatewayBase.SIGNATURE_POLL_TIMEOUT, self.connector.signature_poll_timeout)
+        self.assertEqual(GatewayBase.TX_NOT_FOUND_DEADLINE, self.connector.tx_not_found_deadline)
+        self.assertEqual(120.0, self.connector.signature_poll_timeout)
+        self.assertEqual(120.0, self.connector.tx_not_found_deadline)
+        self.assertTrue(self.connector.not_found_proves_dropped)
+
+    def test_defaults_before_any_network_config_is_read(self):
+        # Waits keep their defaults, but nothing is re-submitted on NOT_FOUND until the
+        # config has said which kind of network this is.
+        self.assertEqual(120.0, self.connector.signature_poll_timeout)
+        self.assertEqual(120.0, self.connector.tx_not_found_deadline)
+        self.assertFalse(self.connector.not_found_proves_dropped)
+
+    def test_wait_is_derived_from_block_time_and_confirmations(self):
+        self.connector._read_network_timing({"blockTimeSeconds": 120, "confirmations": 1})
+        self.assertEqual(720.0, self.connector.signature_poll_timeout)
+        self.assertEqual(720.0, self.connector.tx_not_found_deadline)
+        self.assertFalse(self.connector.not_found_proves_dropped)
+
+        self.connector._read_network_timing({"blockTimeSeconds": 120, "confirmations": 3})
+        self.assertEqual(960.0, self.connector.signature_poll_timeout)
+
+    def test_confirmations_default_to_one(self):
+        self.connector._read_network_timing({"blockTimeSeconds": 30})
+        self.assertEqual(180.0, self.connector.signature_poll_timeout)
+
+    def test_fast_blocks_never_shorten_the_wait_below_the_default(self):
+        self.connector._read_network_timing({"blockTimeSeconds": 2, "confirmations": 1})
+        self.assertEqual(120.0, self.connector.signature_poll_timeout)
+        self.assertEqual(120.0, self.connector.tx_not_found_deadline)
+
+    def test_unusable_values_are_ignored(self):
+        # The waits fall back to the fixed ones, but the key says the network has block
+        # timing, so NOT_FOUND still proves nothing there.
+        for bad in ("soon", 0, -120, None, True, float("inf")):
+            self.connector._read_network_timing({"blockTimeSeconds": bad, "confirmations": 1})
+            self.assertEqual(120.0, self.connector.signature_poll_timeout, bad)
+            self.assertFalse(self.connector.not_found_proves_dropped, bad)
+
+    def test_waits_are_capped(self):
+        # 120s blocks and 30 confirmations would be 120 x (30 + 5) = 4200s.
+        self.connector._read_network_timing({"blockTimeSeconds": 120, "confirmations": 30})
+        self.assertEqual(GatewayBase.MAX_SIGNATURE_POLL_TIMEOUT, self.connector.signature_poll_timeout)
+        self.assertEqual(3600.0, self.connector.signature_poll_timeout)
+        self.assertEqual(3600.0, self.connector.tx_not_found_deadline)
+
+    def test_native_decimals_read_only_when_a_whole_number(self):
+        self.connector._read_network_timing({"nativeDecimals": 9})
+        self.assertEqual(9, self.connector._native_decimals)
+        for bad in ("9", 9.5, -1, True):
+            self.connector._read_network_timing({"nativeDecimals": bad})
+            self.assertIsNone(self.connector._native_decimals, bad)
+
+
+class GatewayBaseStartNetworkTimingTest(unittest.IsolatedAsyncioTestCase):
+    """start_network reads the timing from the same network config call that gives the swap provider."""
+
+    def tearDown(self) -> None:
+        from hummingbot.client.settings import AllConnectorSettings
+        AllConnectorSettings.get_connector_settings().pop("test_connector", None)
+        super().tearDown()
+
+    async def test_start_network_applies_the_networks_block_timing(self):
+        connector = MockGatewayConnector()
+        connector._trading_required = False
+        connector._chain, connector._network = "ergo", "mainnet"
+        gateway = MagicMock()
+        gateway.get_configuration = AsyncMock(return_value={
+            "swapProvider": "ergodex/amm", "nativeCurrencySymbol": "ERG",
+            "blockTimeSeconds": 120, "confirmations": 1, "nativeDecimals": 9,
+        })
+        gateway.get_network_status = AsyncMock(return_value={})
+        gateway.get_native_currency_symbol = AsyncMock(return_value="ERG")
+        gateway.get_tokens = AsyncMock(return_value={"tokens": []})
+        with patch("hummingbot.connector.gateway.gateway_base.GatewayHttpClient.get_instance", return_value=gateway):
+            await connector.start_network()
+            await asyncio.sleep(0)  # let the chain-info task it starts run
+            await connector.stop_network()
+
+        gateway.get_configuration.assert_awaited_with("ergo-mainnet")
+        self.assertEqual("ergodex/amm", connector.swap_provider)
+        self.assertEqual(720.0, connector.signature_poll_timeout)
+        self.assertEqual(9, connector._native_decimals)
+
+    async def _start_with_configuration(self, get_configuration: AsyncMock) -> MockGatewayConnector:
+        connector = MockGatewayConnector()
+        connector._trading_required = False
+        gateway = MagicMock()
+        gateway.get_configuration = get_configuration
+        gateway.get_network_status = AsyncMock(return_value={})
+        gateway.get_native_currency_symbol = AsyncMock(return_value="SOL")
+        gateway.get_tokens = AsyncMock(return_value={"tokens": []})
+        with patch("hummingbot.connector.gateway.gateway_base.GatewayHttpClient.get_instance", return_value=gateway):
+            await connector.start_network()
+            await asyncio.sleep(0)  # let the chain-info task it starts run
+            await connector.stop_network()
+        return connector
+
+    async def test_a_network_config_that_cannot_be_read_never_allows_a_resubmission(self):
+        connector = await self._start_with_configuration(AsyncMock(side_effect=asyncio.TimeoutError()))
+        self.assertFalse(connector.not_found_proves_dropped)
+        self.assertEqual(120.0, connector.signature_poll_timeout)
+
+    async def test_a_stock_solana_network_config_keeps_the_resubmission_rule(self):
+        connector = await self._start_with_configuration(AsyncMock(return_value={
+            "swapProvider": "jupiter/router", "nativeCurrencySymbol": "SOL",
+        }))
+        self.assertTrue(connector.not_found_proves_dropped)
+        self.assertEqual(120.0, connector.signature_poll_timeout)
+
+    async def test_a_config_read_after_a_failed_start_restores_the_networks_rules(self):
+        get_configuration = AsyncMock(side_effect=[asyncio.TimeoutError(), STOCK_SOLANA_CONFIG])
+        connector = await self._start_with_configuration(get_configuration)
+        self.assertFalse(connector.not_found_proves_dropped)
+        self.assertIsNone(connector.swap_provider)
+
+        start = 1640000000.0
+        connector._set_current_timestamp(start)
+        connector.start_tracking_order(
+            order_id="dropped", exchange_order_id="sig-1", trading_pair="SOL-USDC",
+            trade_type=TradeType.BUY, price=Decimal("100"), amount=Decimal("1"),
+        )
+        connector._set_current_timestamp(start + GatewayBase.TX_NOT_FOUND_DEADLINE + 1.0)
+        gateway = MagicMock()
+        gateway.get_configuration = get_configuration
+        gateway.get_transaction_status = AsyncMock(return_value={"signature": "sig-1", "txStatus": -2, "fee": 0})
+        with patch.object(MockGatewayConnector, "_get_gateway_instance", return_value=gateway):
+            await connector.update_order_status([connector.get_order("dropped")])
+
+        get_configuration.assert_awaited_with("solana-mainnet-beta")
+        self.assertTrue(connector.not_found_proves_dropped)
+        self.assertEqual("jupiter/router", connector.swap_provider)
+        self.assertEqual(1, connector._order_tracker._order_not_found_records["dropped"])
+
+    async def test_an_unreadable_config_is_asked_for_at_most_once_per_retry_interval(self):
+        connector = MockGatewayConnector()
+        gateway = MagicMock()
+        gateway.get_configuration = AsyncMock(side_effect=asyncio.TimeoutError())
+        clock = MagicMock()
+        clock.time.return_value = 1000.0
+        with patch.object(gateway_base, "time", clock), \
+                patch.object(MockGatewayConnector, "_get_gateway_instance", return_value=gateway):
+            await connector.update_order_status([])
+            clock.time.return_value += connector.NETWORK_CONFIG_RETRY_INTERVAL - 1
+            await connector.update_order_status([])
+            self.assertEqual(1, gateway.get_configuration.await_count)
+            self.assertFalse(connector.not_found_proves_dropped)
+
+            clock.time.return_value += 1
+            gateway.get_configuration = AsyncMock(return_value=STOCK_SOLANA_CONFIG)
+            await connector.update_order_status([])
+            self.assertTrue(connector.not_found_proves_dropped)
+
+            await connector.update_order_status([])
+        gateway.get_configuration.assert_awaited_once()
+
+
+class GatewayBaseBlockTimedResubmissionTest(GatewayBaseResubmitReconciliationTest):
+    """On a network that publishes block timing, NOT_FOUND at the deadline is no proof of a drop.
+
+    Such a network states no expiry for its transactions: one its node has lost may still
+    be held elsewhere and land later, so re-submitting could trade twice. The transaction
+    is handed back unresolved, with its signature, for the order-status loop to resolve.
+    The inherited tests run here too, except the one that expects a re-submission.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Block time small enough that the shrunk 0.05s floor still governs the deadline.
+        self.connector._read_network_timing({"blockTimeSeconds": 0.001, "confirmations": 1})
+
+    def test_pending_dropped_resubmits_once(self):
+        self.skipTest("Re-submission on NOT_FOUND applies only where it proves a drop; see below.")
+
+    def test_timeout_then_not_found_resubmits_once(self):
+        self.skipTest("Re-submission on NOT_FOUND applies only where it proves a drop; see below.")
+
+    def test_pending_then_not_found_is_not_resubmitted(self):
+        self._patch_poll([-2])
+        with self.assertRaises(TransactionUnresolvedError) as ctx:
+            asyncio.run(self.connector._execute_with_retry(
+                self._pending_operation, "test swap", max_retries=10, retry_delay=0.0))
+        self.assertEqual("sig-1", ctx.exception.signature)
+        self.assertIn("TX_UNRESOLVED", str(ctx.exception))
+        self.assertEqual(1, self.submissions)
+
+    def test_unknown_submit_outcome_then_not_found_is_not_resubmitted(self):
+        # The answer a slow-block Gateway gives when the node's reply to the submit was
+        # lost: the transaction id, and "do not resubmit".
+        self._patch_poll([-2])
+
+        async def operation():
+            self.submissions += 1
+            raise GatewayError(
+                "Transaction 4f2a pending: the node's answer to the submit was lost (socket hang up). "
+                "Poll /chains/ergo/poll with this signature until it confirms or fails before any new swap; "
+                "do not resubmit.",
+                status=504, code="TRANSACTION_TIMEOUT",
+            )
+
+        with self.assertRaises(TransactionUnresolvedError) as ctx:
+            asyncio.run(self.connector._execute_with_retry(
+                operation, "test swap", max_retries=10, retry_delay=0.0))
+        self.assertEqual("4f2a", ctx.exception.signature)
+        self.assertEqual(1, self.submissions)
+
+    def test_timeout_not_found_at_an_exhausted_budget_carries_the_signature(self):
+        self._patch_poll([-2])
+
+        async def operation():
+            self.submissions += 1
+            raise GatewayError(
+                "Transaction 4f2a pending: the node's answer to the submit was lost (socket hang up). "
+                "do not resubmit.",
+                status=504, code="TRANSACTION_TIMEOUT",
+            )
+
+        with self.assertRaises(TransactionUnresolvedError) as ctx:
+            asyncio.run(self.connector._execute_with_retry(
+                operation, "test swap", max_retries=0, retry_delay=0.0))
+        self.assertEqual("4f2a", ctx.exception.signature)
+        self.assertEqual(1, self.submissions)
+
+    def test_still_pending_at_the_deadline_carries_the_signature(self):
+        self._patch_poll([0])
+        with self.assertRaises(TransactionUnresolvedError) as ctx:
+            asyncio.run(self.connector._execute_with_retry(
+                self._pending_operation, "test swap", max_retries=10, retry_delay=0.0))
+        self.assertEqual("sig-1", ctx.exception.signature)
+
+
+class GatewayBaseResubmitAfterAFailedConfigReadTest(GatewayBaseResubmitReconciliationTest):
+    """The same rules on a Solana connector whose network config could be read only on the second try."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        read_network_config_after_one_failure(self.connector, asyncio.run)
+
+
+class GatewayBaseNotFoundPollingAfterAFailedConfigReadTest(GatewayBaseNotFoundPollingTest):
+    """The same rules on a Solana connector whose network config could be read only on the second try."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        read_network_config_after_one_failure(self.connector, self.async_run_with_timeout)
+
+
+class GatewayBaseOrderHashPairingTest(unittest.IsolatedAsyncioTestCase):
+    """Each order is resolved with its own transaction's status.
+
+    An order whose swap is still being polled has no hash yet. It used to be dropped from
+    the hash list but not from the order list, so the next order's status was applied to
+    it: a fill booked on an order whose transaction had not landed.
+    """
+
+    async def test_an_order_without_a_hash_does_not_take_the_next_orders_status(self):
+        connector = MockGatewayConnector()
+        connector._set_current_timestamp(1640000000.0)
+        connector.start_tracking_order(
+            order_id="no-hash-yet", trading_pair="SOL-USDC", trade_type=TradeType.BUY,
+            price=Decimal("100"), amount=Decimal("1"),
+        )
+        connector.start_tracking_order(
+            order_id="has-hash", exchange_order_id="sig-b", trading_pair="SOL-USDC", trade_type=TradeType.BUY,
+            price=Decimal("100"), amount=Decimal("2"),
+        )
+        gateway = MagicMock()
+        gateway.get_transaction_status = AsyncMock(return_value={"signature": "sig-b", "txStatus": 1, "fee": 0})
+        orders = [connector.get_order("no-hash-yet"), connector.get_order("has-hash")]
+        with patch("hummingbot.connector.gateway.gateway_in_flight_order.GET_GATEWAY_EX_ORDER_ID_TIMEOUT", 0.01), \
+                patch.object(MockGatewayConnector, "_get_gateway_instance", return_value=gateway):
+            await connector.update_order_status(orders)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        gateway.get_transaction_status.assert_awaited_once_with("solana", "mainnet-beta", "sig-b")
+        self.assertEqual(Decimal("0"), orders[0].executed_amount_base)
+        self.assertTrue(orders[0].is_open)
+        self.assertEqual(Decimal("2"), orders[1].executed_amount_base)
 
 
 if __name__ == "__main__":

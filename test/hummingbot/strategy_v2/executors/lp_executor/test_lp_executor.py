@@ -1854,6 +1854,25 @@ class TestLPExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
         self.assertEqual(executor._hold_reason, "closeout_swap_failed")
 
+    async def test_closeout_swap_that_may_have_been_submitted_is_never_placed_again(self):
+        """A close-out swap whose submit reply was lost holds the tokens at once instead
+        of re-placing a swap that may already be on its way to the chain."""
+        executor = self.get_executor()
+        executor.connectors = {}
+
+        executor._handle_swap_failure(ValueError(
+            "ServerDisconnectedError('Server disconnected') [code: SUBMIT_OUTCOME_UNKNOWN]"
+        ))
+
+        self.assertEqual(executor.lp_position_state.state, LPExecutorStates.COMPLETE)
+        self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
+        self.assertEqual(executor._hold_reason, "closeout_swap_outcome_unknown")
+        self.assertTrue(self.is_partially_logged(
+            "ERROR", "Close-out swap may have been submitted (ServerDisconnectedError('Server disconnected') "
+            "[code: SUBMIT_OUTCOME_UNKNOWN]); holding the withdrawn tokens. Check the chain before trading them."
+        ))
+        self.assertFalse(self.is_partially_logged("ERROR", "Close-out swap failed"))
+
     async def test_execute_closeout_swap_no_swap_provider(self):
         """Missing swap_provider exhausts the swap attempts into a POSITION_HOLD."""
         executor = self.get_executor()

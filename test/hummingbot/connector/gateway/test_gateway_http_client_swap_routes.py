@@ -57,6 +57,46 @@ class GatewayHttpClientSwapRouteTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("WALLET", payload["walletAddress"])
         self.assertNotIn("network", payload)
 
+    async def _amm_execute(self, **kwargs):
+        with patch.object(self.client, "api_request", new=AsyncMock(return_value={"signature": "sig"})) as mock_req:
+            await self.client.execute_swap(
+                network="mainnet", chain="ergo", dex="ergodex", trading_type="amm",
+                base_asset="RSN", quote_asset="ERG", amount=Decimal("100"), wallet_address="WALLET", **kwargs,
+            )
+        return mock_req
+
+    async def test_execute_swap_sends_the_sell_limit_on_the_amm_route(self):
+        mock_req = await self._amm_execute(side=TradeType.SELL, min_amount_out=Decimal("2.3166"))
+        payload = mock_req.call_args.args[2]
+        self.assertEqual("trading/amm/execute-swap", mock_req.call_args.args[1])
+        # A JSON number, like every other amount the client sends.
+        self.assertEqual(2.3166, payload["minAmountOut"])
+        self.assertIsInstance(payload["minAmountOut"], float)
+        self.assertNotIn("maxAmountIn", payload)
+
+    async def test_execute_swap_sends_the_buy_limit_on_the_amm_route(self):
+        mock_req = await self._amm_execute(side=TradeType.BUY, max_amount_in=Decimal("2.3634"))
+        payload = mock_req.call_args.args[2]
+        self.assertEqual(2.3634, payload["maxAmountIn"])
+        self.assertNotIn("minAmountOut", payload)
+
+    async def test_execute_swap_without_limits_sends_neither_field(self):
+        mock_req = await self._amm_execute(side=TradeType.SELL)
+        payload = mock_req.call_args.args[2]
+        self.assertNotIn("minAmountOut", payload)
+        self.assertNotIn("maxAmountIn", payload)
+
+    async def test_execute_swap_never_sends_a_limit_on_the_router_route(self):
+        # The router route forbids undeclared fields; a limit there would fail every swap.
+        with patch.object(self.client, "api_request", new=AsyncMock(return_value={"signature": "sig"})) as mock_req:
+            with self.assertRaises(ValueError):
+                await self.client.execute_swap(
+                    network="mainnet-beta", chain="solana", dex="jupiter", trading_type="router",
+                    base_asset="SOL", quote_asset="USDC", amount=Decimal("1"), side=TradeType.SELL,
+                    wallet_address="WALLET", min_amount_out=Decimal("150"),
+                )
+        mock_req.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

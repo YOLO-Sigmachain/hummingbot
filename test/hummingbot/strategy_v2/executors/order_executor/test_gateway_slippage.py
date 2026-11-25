@@ -8,6 +8,7 @@ retry sent the identical request.
 The reason a failure can be told apart at all is that the connector now remembers what
 Gateway said. The order tracker records FAILED and nothing else.
 """
+import asyncio
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import MagicMock
@@ -17,7 +18,8 @@ from hummingbot.core.data_type.common import OrderType, PositionAction, TradeTyp
 from hummingbot.core.event.events import MarketOrderFailureEvent
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
-from hummingbot.strategy_v2.models.executors import TrackedOrder
+from hummingbot.strategy_v2.models.base import RunnableStatus
+from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
 
 def a_config(**overrides) -> OrderExecutorConfig:
@@ -116,6 +118,62 @@ class TestTheRampIsGatewayOnly(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(
             executor.place_order.call_args.kwargs["position_action"], PositionAction.OPEN
         )
+
+    async def test_a_swap_that_may_have_been_submitted_is_never_placed_again(self):
+        # The reply to the submit was lost: the swap may be on its way to the chain.
+        connector = MagicMock(spec=Gateway)
+        connector.order_failure_reason.return_value = (
+            "ServerDisconnectedError('Server disconnected') [code: SUBMIT_OUTCOME_UNKNOWN]"
+        )
+        executor = self.an_executor(connector)
+        executor._status = RunnableStatus.RUNNING
+
+        executor.process_order_failed_event(None, MagicMock(), self._failure())
+        # One tick of the control loop, in its own order: the control task, then the retry check.
+        await executor.control_task()
+        executor.evaluate_max_retries()
+
+        connector.place_order.assert_not_called()
+        self.assertGreater(executor._current_retries, executor._max_retries)
+        self.assertEqual(RunnableStatus.TERMINATED, executor.status)
+        self.assertEqual(CloseType.FAILED, executor.close_type)
+
+    async def test_the_running_control_loop_places_a_possibly_submitted_swap_only_once(self):
+        connector = MagicMock(spec=Gateway)
+        connector.place_order.return_value = "order-1"
+        connector.order_failure_reason.return_value = (
+            "ServerDisconnectedError('Server disconnected') [code: SUBMIT_OUTCOME_UNKNOWN]"
+        )
+        executor = self.an_executor(connector)
+        executor._order = None
+        executor.update_interval = 0.01
+        executor._status = RunnableStatus.RUNNING
+        loop = asyncio.ensure_future(executor.control_loop())
+        for _ in range(100):
+            await asyncio.sleep(0.001)
+            if connector.place_order.called:
+                break
+        self.assertEqual(1, connector.place_order.call_count)
+
+        # The order fails while the loop sleeps between ticks, as the order tracker reports it.
+        executor.process_order_failed_event(None, MagicMock(), self._failure())
+        await asyncio.wait_for(loop, timeout=1)
+
+        self.assertEqual(1, connector.place_order.call_count)
+        self.assertEqual(RunnableStatus.TERMINATED, executor.status)
+        self.assertEqual(CloseType.FAILED, executor.close_type)
+
+    def test_any_other_failure_leaves_the_retry_budget_as_it_was(self):
+        connector = MagicMock(spec=Gateway)
+        connector.order_failure_reason.return_value = "Gateway error: insufficient balance"
+        executor = self.an_executor(connector)
+        executor.stop = MagicMock()
+
+        executor.process_order_failed_event(None, MagicMock(), self._failure())
+        executor.evaluate_max_retries()
+
+        self.assertEqual(1, executor._current_retries)
+        executor.stop.assert_not_called()
 
 
 class TestConfigValidation(IsolatedAsyncioWrapperTestCase):

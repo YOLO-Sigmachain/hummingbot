@@ -4,6 +4,7 @@ from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCa
 from test.logger_mixin_for_test import LoggerMixinForTest, LogLevel
 from unittest.mock import AsyncMock, patch
 
+from hummingbot.client.settings import GATEWAY_CHAINS
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.data_feed.amm_gateway_data_feed import AmmGatewayDataFeed
 
@@ -136,6 +137,35 @@ class TestAmmGatewayDataFeed(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest)
                 order_amount_in_base=Decimal("1"),
             )
         self.assertIn("Invalid network", str(context.exception))
+
+    def test_network_of_a_chain_gateway_reports_is_accepted(self):
+        # A chain Gateway serves from config alone, absent from the built-in Chain list.
+        saved = list(GATEWAY_CHAINS)
+        GATEWAY_CHAINS[:] = ["ethereum", "solana", "examplechain"]
+        try:
+            feed = AmmGatewayDataFeed(
+                network="examplechain-mainnet",
+                trading_pairs={"AAA-BBB"},
+                order_amount_in_base=Decimal("1"),
+            )
+        finally:
+            GATEWAY_CHAINS[:] = saved
+        self.assertEqual("examplechain", feed.chain)
+        self.assertEqual("examplechain-mainnet", feed.network)
+
+    def test_an_ergo_network_is_accepted_before_gateway_has_reported_its_chains(self):
+        saved = list(GATEWAY_CHAINS)
+        GATEWAY_CHAINS.clear()
+        try:
+            feed = AmmGatewayDataFeed(
+                network="ergo-mainnet",
+                trading_pairs={"RSN-ERG"},
+                order_amount_in_base=Decimal("1"),
+            )
+        finally:
+            GATEWAY_CHAINS[:] = saved
+        self.assertEqual("ergo", feed.chain)
+        self.assertEqual("ergo-mainnet", feed.network)
 
     def test_gateway_client_lazy_initialization(self):
         # Test lines 35-37: Gateway client lazy initialization

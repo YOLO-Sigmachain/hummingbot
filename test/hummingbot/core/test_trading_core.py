@@ -410,6 +410,27 @@ class TradingCoreTest(IsolatedAsyncioWrapperTestCase):
             self.assertEqual(mock_create.call_count, 2)
             mock_init_recorder.assert_called_once()
 
+    @patch.object(TradingCore, "initialize_markets_recorder")
+    async def test_initialize_markets_waits_for_gateway_for_every_known_chain(self, _):
+        """A network connector of any chain the client knows waits for Gateway, also before
+        Gateway has reported its chains: that is what registers the network connectors."""
+        from hummingbot.client.settings import GATEWAY_CHAINS
+        saved = list(GATEWAY_CHAINS)
+        self.addCleanup(lambda: GATEWAY_CHAINS.__setitem__(slice(None), saved))
+        GATEWAY_CHAINS.clear()
+        monitor = Mock()
+        monitor.wait_for_online_status = AsyncMock()
+        monitor.ensure_gateway_connectors_registered = AsyncMock()
+        with patch.object(self.trading_core, "_gateway_monitor", monitor), \
+                patch.object(self.trading_core.connector_manager, "create_connector", return_value=self.mock_connector):
+            for network in ("ergo-mainnet", "solana-mainnet-beta", "ethereum-mainnet"):
+                await self.trading_core.initialize_markets([(network, ["ERG-SigUSD"])])
+            self.assertEqual(3, monitor.wait_for_online_status.await_count)
+            self.assertEqual(3, monitor.ensure_gateway_connectors_registered.await_count)
+
+            await self.trading_core.initialize_markets([("binance", ["BTC-USDT"])])
+            self.assertEqual(3, monitor.wait_for_online_status.await_count)
+
     @patch.object(TradingCore, "stop_strategy")
     @patch.object(TradingCore, "stop_clock")
     @patch.object(TradingCore, "remove_connector")

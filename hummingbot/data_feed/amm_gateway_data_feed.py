@@ -5,7 +5,7 @@ from typing import Dict, Optional, Set
 
 from pydantic import BaseModel
 
-from hummingbot.connector.gateway.common_types import Chain
+from hummingbot.connector.gateway.common_types import known_chains
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient
@@ -63,12 +63,12 @@ class AmmGatewayDataFeed(NetworkBase):
         # swapProvider that quotes it. So the feed is configured with a network, not with
         # a dex: picking the dex is Gateway's job, and doing it here would let the feed
         # quote one venue while the connectors trade another.
-        known_chains = tuple(c.chain for c in Chain)
-        if not network.startswith(tuple(f"{chain}-" for chain in known_chains)):
+        chains = known_chains()
+        if not network.startswith(tuple(f"{chain}-" for chain in chains)):
             raise ValueError(
                 f"Invalid network: {network}. Use Gateway's 'chain-network' format, "
                 f"e.g. 'solana-mainnet-beta' or 'ethereum-mainnet' "
-                f"(chains: {', '.join(known_chains)})"
+                f"(chains: {', '.join(chains)})"
             )
         self._chain = network.split("-", 1)[0]
         # Read from the network's config on the first price fetch. The lock is what makes

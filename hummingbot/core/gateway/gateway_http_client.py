@@ -988,6 +988,8 @@ class GatewayHttpClient:
         slippage_pct: Optional[Decimal] = None,
         wallet_address: Optional[str] = None,
         chain: Optional[str] = None,
+        min_amount_out: Optional[Decimal] = None,
+        max_amount_in: Optional[Decimal] = None,
     ) -> Dict[str, Any]:
         """
         Execute a swap on the specified DEX via /trading/{router,clmm,amm}/execute-swap.
@@ -1002,6 +1004,10 @@ class GatewayHttpClient:
         :param slippage_pct: Optional slippage percentage
         :param wallet_address: Wallet address to execute the swap
         :param chain: Chain name; combined with a short network to form the "chain-network" the endpoint requires.
+        :param min_amount_out: Optional, SELL on the AMM route only: the least quote token, in whole
+            units, the swap may give. A connector that honours it refuses a swap below it.
+        :param max_amount_in: Optional, BUY on the AMM route only: the most quote token, in whole
+            units, the swap may take. A connector that honours it refuses a swap above it.
         """
         if side not in [TradeType.BUY, TradeType.SELL]:
             raise ValueError("Only BUY and SELL prices are supported.")
@@ -1030,10 +1036,21 @@ class GatewayHttpClient:
             slippagePct=slippage_pct,
             walletAddress=wallet_address,
         )
+        body = _body(request)
+        # Not in the generated models: a stock Gateway's AMM route does not declare these
+        # fields, but it does not forbid undeclared ones either, so it accepts and ignores
+        # them, while a Gateway that declares them binds the swap to them. The router
+        # route forbids undeclared fields, so they are never sent anywhere but the AMM route.
+        limits = {"minAmountOut": min_amount_out, "maxAmountIn": max_amount_in}
+        limits = {key: value for key, value in limits.items() if value is not None}
+        if limits:
+            if trading_type != "amm":
+                raise ValueError(f"{', '.join(limits)} can only be sent on the AMM route, not '{trading_type}'")
+            body.update({key: float(value) for key, value in limits.items()})
         return await self.api_request(
             "post",
             f"trading/{trading_type}/execute-swap",
-            _body(request)
+            body
         )
 
     async def execute_quote(

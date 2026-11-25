@@ -670,8 +670,8 @@ class TradingCore:
         for connector_name, trading_pairs in market_names:
             # Check if this is a gateway connector (chain-network format like "solana-mainnet-beta")
             if "-" in connector_name:
-                from hummingbot.client.settings import GATEWAY_CHAINS
-                known_chains = {c.lower() for c in GATEWAY_CHAINS} if GATEWAY_CHAINS else {"solana", "ethereum"}
+                from hummingbot.connector.gateway.common_types import known_chains as _known_chains
+                known_chains = set(_known_chains())
                 chain = connector_name.split("-", 1)[0].lower()
                 if chain in known_chains:
                     await self.gateway_monitor.wait_for_online_status()

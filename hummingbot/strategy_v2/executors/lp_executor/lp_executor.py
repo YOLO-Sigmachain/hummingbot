@@ -1095,6 +1095,11 @@ class LPExecutor(ExecutorBase):
         """
         self.lp_position_state.active_swap_order = None
         self._swap_failure_count += 1
+        # A swap whose submission may have reached the chain is never placed again:
+        # spending the close-out swap's attempts holds the tokens instead.
+        if "[code: SUBMIT_OUTCOME_UNKNOWN]" in str(error):
+            self._swap_failure_count = self.MAX_CLOSEOUT_SWAP_ATTEMPTS
+            self._hold_reason = "closeout_swap_outcome_unknown"
         # Widen for the next quote when the market moved further than the tolerance.
         # The swap has its own small budget, so the ramp has to fit inside it — with the
         # default multiplier of 5 it reaches the ceiling in three attempts, which is the
@@ -1108,11 +1113,18 @@ class LPExecutor(ExecutorBase):
             )
             return  # stay in SWAPPING; next tick re-places at market
 
-        self.logger().error(
-            f"Close-out swap failed {self._swap_failure_count} times: {error}. "
-            "Holding the withdrawn tokens instead of reporting FAILED with hidden exposure."
-        )
-        self._hold_reason = "closeout_swap_failed"
+        if self._hold_reason == "closeout_swap_outcome_unknown":
+            self.logger().error(
+                f"Close-out swap may have been submitted ({error}); holding the withdrawn tokens. "
+                "Check the chain before trading them."
+            )
+        else:
+            self.logger().error(
+                f"Close-out swap failed {self._swap_failure_count} times: {error}. "
+                "Holding the withdrawn tokens instead of reporting FAILED with hidden exposure."
+            )
+        if self._hold_reason is None:
+            self._hold_reason = "closeout_swap_failed"
         self.close_type = CloseType.POSITION_HOLD
         connector = self.connectors.get(self.config.connector_name)
         current_price = self._current_price if self._current_price else Decimal("0")
