@@ -122,6 +122,14 @@ amm_arb_config_map = {
         default=False,
         validator=validate_bool,
         type_str="bool"),
+    "cex_leg_timeout": ConfigVar(
+        key="cex_leg_timeout",
+        prompt="When orders are not submitted concurrently, how many seconds should the bot wait for the second "
+               "(non-Gateway) order to fill before cancelling it? >>> ",
+        default=Decimal("30"),
+        validator=lambda v: validate_decimal(v, Decimal("0"), inclusive=False),
+        prompt_on_new=False,
+        type_str="decimal"),
     "rate_oracle_enabled": ConfigVar(
         key="rate_oracle_enabled",
         prompt="Do you want to use the rate oracle? (Yes/No) >>> ",

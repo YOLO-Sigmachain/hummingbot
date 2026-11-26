@@ -11,6 +11,7 @@ import pandas as pd
 from hummingbot.client.performance import PerformanceMetrics
 from hummingbot.client.settings import AllConnectorSettings
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.clock import Clock
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.market_order import MarketOrder
@@ -18,7 +19,9 @@ from hummingbot.core.data_type.trade_fee import TokenAmount
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
     MarketOrderFailureEvent,
+    OrderCancelledEvent,
     OrderExpiredEvent,
+    OrderFilledEvent,
     OrderType,
     SellOrderCompletedEvent,
 )
@@ -92,6 +95,11 @@ class AmmArbStrategy(StrategyPyBase):
     _market_2_quote_eth_rate: None          # XXX (martin_kou): Why are these here?
     _rate_source: Optional[RateOracle]
 
+    # The second wait after a cancel is cex_leg_timeout plus at least this (NonKYC: 6 deferrals x 5 s)
+    CEX_CANCEL_SETTLE_MIN_SECONDS = 30.0
+    # How often to ask the connector whether the order request has gone out
+    CREATE_SENT_POLL_SECONDS = 0.1
+
     @classmethod
     def logger(cls) -> HummingbotLogger:
         global amm_logger
@@ -109,6 +117,7 @@ class AmmArbStrategy(StrategyPyBase):
                     concurrent_orders_submission: bool = True,
                     status_report_interval: float = 900,
                     rate_source: Optional[RateOracle] = RateOracle.get_instance(),
+                    cex_leg_timeout: float = 30.0,
                     ):
         """
         Assigns strategy parameters, this function must be called directly after init.
@@ -127,6 +136,8 @@ class AmmArbStrategy(StrategyPyBase):
         If false, the bot will wait for first exchange order filled before submitting the other order.
         :param status_report_interval: Amount of seconds to wait to refresh the status report
         :param rate_source: The rate source to use for conversion rate - (RateOracle or FixedRateSource) - default is FixedRateSource
+        :param cex_leg_timeout: when orders are not submitted concurrently, seconds to wait for the second
+        (non-Gateway) leg to finish before it is cancelled
         """
         self._market_info_1 = market_info_1
         self._market_info_2 = market_info_2
@@ -160,6 +171,16 @@ class AmmArbStrategy(StrategyPyBase):
         # order_id -> (base, quote) balance read right before placing it; dropped when the order ends
         # unless it is held.
         self._placement_balances: Dict[str, Tuple[Optional[Decimal], Optional[Decimal]]] = {}
+        self._cex_leg_timeout = float(cex_leg_timeout)
+        # order_id -> base amount filled so far, from fill events
+        self._filled_base: Dict[str, Decimal] = {}
+        # Set when the second leg failed after the first leg traded: no new proposal until
+        # the strategy is restarted. See _halt_unhedged.
+        self._halted = False
+        self._halt_reason: Optional[str] = None
+        # The leg that caused the halt, so a fill of it booked later corrects the halt message
+        self._halt_order_id: Optional[str] = None
+        self._halt_context: Optional[Tuple[ArbProposal, ArbProposalSide, str]] = None
         # A stop/start of the strategy in this process keeps the holds of its markets: same
         # connector name, and the same wallet address when both are known.
         for order_id, record in _PROCESS_OUTCOME_HOLDS.items():
@@ -252,6 +273,8 @@ class AmmArbStrategy(StrategyPyBase):
         min profitability required, applies the slippage buffer, applies budget constraint, then finally execute the
         arbitrage.
         """
+        if self._halted:
+            return
         if not await self.outcome_holds_settled():
             return
         self._all_arb_proposals = await create_arb_proposals(
@@ -350,19 +373,25 @@ class AmmArbStrategy(StrategyPyBase):
         :param arb_proposals: the arbitrage proposal
         """
         for arb_proposal in arb_proposals:
-            if self._outcome_holds:
-                # An earlier leg may still land: start no further proposal.
+            if self._outcome_holds or self._halted:
+                # An earlier leg may still land, or a leg was left unhedged: start no further proposal.
                 return
             if any(p.amount <= s_decimal_zero for p in (arb_proposal.first_side, arb_proposal.second_side)):
                 continue
 
             if not self._concurrent_orders_submission:
                 arb_proposal = self.prioritize_evm_exchanges(arb_proposal)
+
+            # Check the non-Gateway leg as its connector would, before the irreversible Gateway leg goes out.
+            refusal = self._local_refusal(arb_proposal)
+            if refusal is not None:
+                self.logger().info(f"Skipping arbitrage proposal: {refusal}")
+                continue
             self._current_arb_proposal = arb_proposal
 
             self.logger().info(f"Found arbitrage opportunity!: {arb_proposal}")
 
-            for arb_side in (arb_proposal.first_side, arb_proposal.second_side):
+            for index, arb_side in enumerate((arb_proposal.first_side, arb_proposal.second_side)):
                 side: str = "BUY" if arb_side.is_buy else "SELL"
                 self.log_with_clock(logging.INFO,
                                     f"Placing {side} order for {arb_side.amount} {arb_side.market_info.base_asset} "
@@ -384,14 +413,164 @@ class AmmArbStrategy(StrategyPyBase):
                     self._placement_balances[order_id] = placement_balances
 
                 if not self._concurrent_orders_submission:
-                    await arb_side.completed_event.wait()
+                    is_second_leg = index == 1
+                    if is_second_leg and not self.is_gateway_market(arb_side.market_info):
+                        if not await self._wait_for_cex_leg(arb_proposal, arb_side, order_id):
+                            return
+                    else:
+                        await arb_side.completed_event.wait()
                     if arb_side.is_failed:
                         self.log_with_clock(logging.ERROR,
                                             f"Order {order_id} seems to have failed in this arbitrage opportunity. "
                                             f"Dropping Arbitrage Proposal. ")
+                        is_held = order_id in self._outcome_holds
+                        if is_second_leg and (not is_held or not self.is_gateway_market(arb_side.market_info)):
+                            # The first leg traded. A definite failure, or a non-Gateway leg of unknown
+                            # outcome: held as well, but the hold ending must not resume trading while
+                            # the first leg may be unhedged.
+                            self._halt_unhedged(arb_proposal, arb_side, order_id, self._failure_wording(order_id))
                         return
 
             await arb_proposal.wait()
+
+    async def _wait_for_cex_leg(self, arb_proposal: ArbProposal, arb_side: ArbProposalSide, order_id: str) -> bool:
+        """
+        Wait for the second, non-Gateway leg. The timer starts when the connector says the
+        order request went out (create_request_sent), when it can say so. Not finished in
+        cex_leg_timeout: cancel it and wait as long again, plus the time the connector may
+        hold back a terminal state while its trades are listed. False when the strategy was
+        halted here (the leg is unhedged).
+        """
+        await self._wait_for_create_sent(arb_side, order_id)
+        try:
+            await asyncio.wait_for(asyncio.shield(arb_side.completed_event.wait()), timeout=self._cex_leg_timeout)
+            return True
+        except asyncio.TimeoutError:
+            pass
+        self.log_with_clock(logging.WARNING,
+                            f"Order {order_id} on {arb_side.market_info.market.display_name} not done after "
+                            f"{self._cex_leg_timeout:.0f} s. Cancelling it.")
+        self.cancel_order(arb_side.market_info, order_id)
+        second_wait = self._cex_leg_timeout + self._cancel_settle_seconds(arb_side.market_info.market)
+        try:
+            await asyncio.wait_for(asyncio.shield(arb_side.completed_event.wait()), timeout=second_wait)
+        except asyncio.TimeoutError:
+            self._halt_unhedged(arb_proposal, arb_side, order_id,
+                                f"was not cancelled within {second_wait:.0f} s and may still be open")
+            return False
+        if arb_side.is_failed:
+            what = ("failed with an unknown outcome and may still fill" if order_id in self._outcome_holds
+                    else "was cancelled after the timeout")
+            self._halt_unhedged(arb_proposal, arb_side, order_id, what)
+            return False
+        return True
+
+    async def _wait_for_create_sent(self, arb_side: ArbProposalSide, order_id: str):
+        """Until the connector says the order request went out, at most cex_leg_timeout. No-op without the hook."""
+        sent = getattr(arb_side.market_info.market, "create_request_sent", None)
+        if not callable(sent):
+            return
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + self._cex_leg_timeout
+        while not arb_side.completed_event.is_set():
+            try:
+                if sent(order_id):
+                    return
+            except Exception:
+                return
+            if loop.time() >= deadline:
+                self.log_with_clock(logging.WARNING,
+                                    f"The request for order {order_id} has not gone out after "
+                                    f"{self._cex_leg_timeout:.0f} s; timing the order from now.")
+                return
+            await asyncio.sleep(self.CREATE_SENT_POLL_SECONDS)
+
+    def _cancel_settle_seconds(self, market: ConnectorBase) -> float:
+        """
+        How long a connector may hold back the terminal state of a cancelled order while its
+        trades are listed: MAX_TERMINAL_DEFERRALS x SHORT_POLL_INTERVAL when it has both, and
+        at least CEX_CANCEL_SETTLE_MIN_SECONDS.
+        """
+        deferrals = getattr(market, "MAX_TERMINAL_DEFERRALS", None)
+        interval = getattr(market, "SHORT_POLL_INTERVAL", None)
+        settle = 0.0
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (deferrals, interval)):
+            settle = float(deferrals) * float(interval)
+        return max(settle, float(self.CEX_CANCEL_SETTLE_MIN_SECONDS))
+
+    def _failure_wording(self, order_id: str) -> str:
+        if order_id in self._outcome_holds:
+            return "failed with an unknown outcome and may still fill"
+        return "failed"
+
+    def _halt_message(self, order_id: str) -> str:
+        arb_proposal, arb_side, what = self._halt_context
+        asked = arb_side.amount
+        filled = self._filled_base.get(order_id, s_decimal_zero)
+        unhedged = max(asked - filled, s_decimal_zero)
+        base = arb_side.market_info.base_asset
+        first = arb_proposal.first_side
+        return (f"Arbitrage halted: the {first.market_info.market.display_name} leg "
+                f"{'bought' if first.is_buy else 'sold'} {first.amount} {first.market_info.base_asset}, but the "
+                f"{arb_side.market_info.market.display_name} leg {order_id} "
+                f"({'buy' if arb_side.is_buy else 'sell'}) {what}: {filled} of {asked} {base} booked so far, so "
+                f"{unhedged} {base} is unhedged. No new arbitrage proposal until the strategy is restarted.")
+
+    def _halt_unhedged(self, arb_proposal: ArbProposal, arb_side: ArbProposalSide, order_id: str, what: str):
+        """The first leg traded and the second did not fill in full: stop starting proposals and say so."""
+        self._halt_order_id = order_id
+        self._halt_context = (arb_proposal, arb_side, what)
+        msg = self._halt_message(order_id)
+        self._halted = True
+        self._halt_reason = msg
+        self.logger().error(msg)
+        self.notify_hb_app_with_timestamp(msg)
+
+    def _report_halt_fill(self, order_id: str):
+        """A fill of the halted leg booked after the halt: say the corrected figures."""
+        msg = "Correction: " + self._halt_message(order_id)
+        self._halt_reason = msg
+        self.logger().error(msg)
+        self.notify_hb_app_with_timestamp(msg)
+
+    def _local_refusal(self, arb_proposal: ArbProposal) -> Optional[str]:
+        """Why a non-Gateway leg of the proposal would be refused by its connector's local checks, or None."""
+        for arb_side in (arb_proposal.first_side, arb_proposal.second_side):
+            if self.is_gateway_market(arb_side.market_info):
+                continue
+            market = arb_side.market_info.market
+            trading_pair = arb_side.market_info.trading_pair
+            check = getattr(market, "check_order_locally", None)
+            if callable(check):
+                reason = check(trading_pair, arb_side.is_buy, arb_side.amount, arb_side.order_price)
+                reason = reason if isinstance(reason, str) and reason else None
+            else:
+                reason = self._trading_rule_refusal(market, trading_pair, arb_side.amount, arb_side.order_price)
+            if reason is not None:
+                return (f"{market.display_name} would refuse the {'buy' if arb_side.is_buy else 'sell'} of "
+                        f"{arb_side.amount} {arb_side.market_info.base_asset} at {arb_side.order_price}: {reason}")
+        return None
+
+    @staticmethod
+    def _trading_rule_refusal(market: ConnectorBase, trading_pair: str, amount: Decimal,
+                              price: Decimal) -> Optional[str]:
+        """Generic check from the trading rules: minimum size, minimum notional, rounding to zero."""
+        try:
+            rule = market.trading_rules.get(trading_pair)
+        except Exception:
+            return None
+        if not isinstance(rule, TradingRule):
+            return None
+        quantized_amount = market.quantize_order_amount(trading_pair, amount)
+        if quantized_amount <= s_decimal_zero:
+            return f"amount {amount} rounds to zero"
+        if quantized_amount < rule.min_order_size:
+            return f"amount {quantized_amount} is below the minimum order size {rule.min_order_size}"
+        quantized_price = market.quantize_order_price(trading_pair, price)
+        if quantized_amount * quantized_price < rule.min_notional_size:
+            return (f"order value {quantized_amount * quantized_price} is below the minimum notional "
+                    f"{rule.min_notional_size}")
+        return None
 
     async def place_arb_order(
             self,
@@ -505,6 +684,8 @@ class AmmArbStrategy(StrategyPyBase):
         for order_id, (_, hold_end) in self._outcome_holds.items():
             warning_lines.append(f"  Order {order_id} has an unknown outcome. No new proposal until "
                                  f"{self._format_ts(hold_end)} and a balance refresh after it.")
+        if self._halted:
+            warning_lines.append(f"  {self._halt_reason}")
         if len(warning_lines) > 0:
             lines.extend(["", "*** WARNINGS ***"] + warning_lines)
 
@@ -750,6 +931,16 @@ class AmmArbStrategy(StrategyPyBase):
 
     def did_expire_order(self, expired_event: OrderExpiredEvent):
         self.set_order_completed(order_id=expired_event.order_id)
+
+    def did_cancel_order(self, cancelled_event: OrderCancelledEvent):
+        # A cancelled leg ends its wait (and the proposal's): it did not fill in full
+        self.set_order_failed(order_id=cancelled_event.order_id)
+
+    def did_fill_order(self, order_filled_event: OrderFilledEvent):
+        order_id = order_filled_event.order_id
+        self._filled_base[order_id] = self._filled_base.get(order_id, s_decimal_zero) + order_filled_event.amount
+        if self._halted and order_id is not None and order_id == self._halt_order_id:
+            self._report_halt_fill(order_id)
 
     @property
     def tracked_limit_orders(self) -> List[Tuple[ConnectorBase, LimitOrder]]:
