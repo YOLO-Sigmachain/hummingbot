@@ -52,6 +52,10 @@ class GatewayInFlightOrder(InFlightOrder):
         if self.creation_transaction_hash is not None:
             self._creation_transaction_hash_update_event.set()
         self._cancel_tx_hash: Optional[str] = None
+        # A swap Gateway answered PENDING with the amounts its transaction fixes: the
+        # transaction's signature and Gateway's `pendingData`. Read only once poll has said
+        # that transaction confirmed. Saved with the order, so it survives a restart.
+        self.pending_swap_data: Optional[Tuple[str, Dict[str, Any]]] = None
 
     @property
     def gas_price(self) -> Decimal:
@@ -205,6 +209,10 @@ class GatewayInFlightOrder(InFlightOrder):
         order._gas_price = Decimal(data["gas_price"]) if data["gas_price"] != "None" else None
         order._creation_transaction_hash = data["creation_transaction_hash"]
         order.last_update_timestamp = data.get("last_update_timestamp", order.creation_timestamp)
+        # Absent in an order saved without it; anything not [signature, dict] is ignored.
+        kept = data.get("pending_swap_data")
+        if isinstance(kept, list) and len(kept) == 2 and isinstance(kept[0], str) and isinstance(kept[1], dict):
+            order.pending_swap_data = (kept[0], dict(kept[1]))
 
         order.check_filled_condition()
 
@@ -215,7 +223,7 @@ class GatewayInFlightOrder(InFlightOrder):
         Returns this InFlightOrder as a JSON object.
         :return: JSON object
         """
-        return {
+        order_json = {
             "client_order_id": self.client_order_id,
             "exchange_order_id": self.exchange_order_id,
             "trading_pair": self.trading_pair,
@@ -236,6 +244,9 @@ class GatewayInFlightOrder(InFlightOrder):
             "creation_transaction_hash": self._creation_transaction_hash,
             "gas_price": str(self._gas_price),
         }
+        if self.pending_swap_data is not None:
+            order_json["pending_swap_data"] = [self.pending_swap_data[0], dict(self.pending_swap_data[1])]
+        return order_json
 
 
 class GatewayPerpetualInFlightOrder(GatewayInFlightOrder):

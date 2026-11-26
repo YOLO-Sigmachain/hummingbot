@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 from hummingbot.connector.gateway.gateway import Gateway
 from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
 from hummingbot.core.event.events import MarketOrderFailureEvent
+from hummingbot.core.gateway.gateway_error import GatewayError
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
 from hummingbot.strategy_v2.models.base import RunnableStatus
@@ -162,6 +163,26 @@ class TestTheRampIsGatewayOnly(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1, connector.place_order.call_count)
         self.assertEqual(RunnableStatus.TERMINATED, executor.status)
         self.assertEqual(CloseType.FAILED, executor.close_type)
+
+    async def test_a_swap_gateway_says_was_not_submitted_is_placed_again(self):
+        # Gateway answered 503: the node could not be reached and nothing was sent.
+        connector = MagicMock(spec=Gateway)
+        connector.place_order.return_value = "order-2"
+        connector.order_failure_reason.return_value = str(GatewayError(
+            "Failed to execute ergodex swap: Transaction 4f was not submitted: the node could not be reached "
+            "(connect ECONNREFUSED 127.0.0.1:9053); nothing was sent, so it cannot confirm. "
+            "Retry once the node is reachable", status=503, http_error="HttpError",
+        ))
+        executor = self.an_executor(connector)
+        executor._status = RunnableStatus.RUNNING
+
+        executor.process_order_failed_event(None, MagicMock(), self._failure())
+        await executor.control_task()
+        executor.evaluate_max_retries()
+
+        connector.place_order.assert_called_once()
+        self.assertEqual(1, executor._current_retries)
+        self.assertEqual(RunnableStatus.RUNNING, executor.status)
 
     def test_any_other_failure_leaves_the_retry_budget_as_it_was(self):
         connector = MagicMock(spec=Gateway)

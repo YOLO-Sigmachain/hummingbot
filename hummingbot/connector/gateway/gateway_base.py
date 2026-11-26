@@ -227,6 +227,8 @@ class GatewayBase(ConnectorBase):
         # Until it has been read, NOT_FOUND is taken to prove nothing (see not_found_proves_dropped).
         self._network_timing_read = False
         self._publishes_block_timing = False
+        # The network config's own statement of whether its transactions expire; None if it makes none.
+        self._transactions_expire: Optional[bool] = None
         # Orders already warned about for a NOT_FOUND that leaves them open.
         self._unresolved_not_found_warned: Set[str] = set()
 
@@ -418,7 +420,9 @@ class GatewayBase(ConnectorBase):
         - `confirmations`: how many blocks, counting the one that includes a transaction,
           Gateway's poll waits for before it reports the transaction confirmed (1 if absent);
         - `nativeDecimals`: the native coin's decimals, which matter when the coin is
-          missing from Gateway's token list.
+          missing from Gateway's token list;
+        - `transactionsExpire`: false says a transaction the network has not taken may
+          still land later, so it is never re-submitted (see not_found_proves_dropped).
 
         A network whose config has none of these (the stock Solana and Ethereum ones) keeps
         the fixed waits and the default resubmission rule unchanged.
@@ -430,6 +434,15 @@ class GatewayBase(ConnectorBase):
         # The key's presence, whatever its value, is what says the network has no
         # blockhash-style expiry (see not_found_proves_dropped).
         self._publishes_block_timing = "blockTimeSeconds" in network_config
+        expire = network_config.get("transactionsExpire")
+        # A value that is not true or false is read as "they do not expire": then a
+        # transaction not found is never re-submitted.
+        self._transactions_expire = (expire is True) if "transactionsExpire" in network_config else None
+        if "transactionsExpire" in network_config and not isinstance(expire, bool):
+            self.logger().error(
+                f"{self._chain}-{self._network}: transactionsExpire {expire!r} is not true or false; "
+                "a transaction not found is never re-submitted."
+            )
         if self._publishes_block_timing and block_time is None:
             self.logger().error(
                 f"{self._chain}-{self._network}: blockTimeSeconds "
@@ -482,12 +495,14 @@ class GatewayBase(ConnectorBase):
         that publishes block timing instead states no such expiry: there a transaction its
         node has lost may still be held elsewhere and land later, so NOT_FOUND proves
         nothing and the transaction is left to the order-status loop, not re-submitted.
+        A network config that says `transactionsExpire: false` rules it out as well; the
+        key never allows a re-submission the rules here would not.
 
         Until the network config has been read, the client cannot tell which kind of
         network it is on, so NOT_FOUND proves nothing there either: a config that could
         not be read never leads to a re-submission.
         """
-        return self._network_timing_read and not self._publishes_block_timing
+        return self._network_timing_read and not self._publishes_block_timing and self._transactions_expire is not False
 
     async def _ensure_network_timing_read(self):
         """Read the network config again if it could not be read yet, at most once per retry interval.
@@ -889,6 +904,9 @@ class GatewayBase(ConnectorBase):
         :raises: Original exception if non-retryable or max retries exceeded
         """
         current_retries = 0
+        # Read once, before the first submit: a network config first read while this call
+        # polls cannot switch re-submission on for a transaction already broadcast.
+        proves_dropped = self.not_found_proves_dropped
 
         while True:
             try:
@@ -927,7 +945,7 @@ class GatewayBase(ConnectorBase):
                             )
                         if on_broadcast is not None:
                             on_broadcast(signature)
-                        outcome = await self._await_signature_terminal(signature, operation_name)
+                        outcome = await self._await_signature_terminal(signature, operation_name, proves_dropped)
                         if outcome == "CONFIRMED":
                             # Landed, but the route's `data` block is gone for good: the
                             # PENDING reply never carried one and poll only returns raw
@@ -936,7 +954,7 @@ class GatewayBase(ConnectorBase):
                             return self._confirmed_without_data(result, signature)
                         # DROPPED: the tx can no longer land, so one fresh submission
                         # is safe — it counts against the retry budget.
-                        self._raise_if_drop_unproven(signature, operation_name)
+                        self._raise_if_drop_unproven(signature, operation_name, proves_dropped)
                         current_retries += 1
                         if current_retries >= max_retries:
                             self.logger().error(
@@ -971,14 +989,14 @@ class GatewayBase(ConnectorBase):
                 if timeout_signature:
                     if on_broadcast is not None:
                         on_broadcast(timeout_signature)
-                    outcome = await self._await_signature_terminal(timeout_signature, operation_name)
+                    outcome = await self._await_signature_terminal(timeout_signature, operation_name, proves_dropped)
                     if outcome == "CONFIRMED":
                         self.logger().warning(
                             f"{operation_name}: transaction {timeout_signature} confirmed after "
                             "timeout; not re-submitting."
                         )
                         return self._confirmed_without_data({}, timeout_signature)
-                    self._raise_if_drop_unproven(timeout_signature, operation_name)
+                    self._raise_if_drop_unproven(timeout_signature, operation_name, proves_dropped)
                     if current_retries >= max_retries:
                         self.logger().error(
                             f"{operation_name} FAILED: transaction {timeout_signature} dropped (never landed) "
@@ -1022,19 +1040,20 @@ class GatewayBase(ConnectorBase):
         reconciled["status"] = 1
         reconciled[TX_DATA_UNAVAILABLE] = True
         self.logger().warning(
-            f"Transaction {signature} confirmed by signature reconciliation; Gateway's response "
-            "data (amounts, fees, position address) is not recoverable for this transaction."
+            f"Transaction {signature} confirmed by signature reconciliation; Gateway's confirmed "
+            "`data` block (amounts, fees, position address) is not available on this path."
         )
         return reconciled
 
-    def _raise_if_drop_unproven(self, signature: str, operation_name: str):
+    def _raise_if_drop_unproven(self, signature: str, operation_name: str, proves_dropped: bool):
         """Stop before a re-submission when NOT_FOUND does not prove the transaction dropped.
 
-        See not_found_proves_dropped. Raising TX_UNRESOLVED leaves the transaction to the
-        order-status loop. On such a network that loop keeps the order open on NOT_FOUND
-        too, and resolves it only on a CONFIRMED or FAILED status of the transaction.
+        See not_found_proves_dropped; `proves_dropped` is its value as read before the
+        first submit. Raising TX_UNRESOLVED leaves the transaction to the order-status
+        loop. On such a network that loop keeps the order open on NOT_FOUND too, and
+        resolves it only on a CONFIRMED or FAILED status of the transaction.
         """
-        if self.not_found_proves_dropped:
+        if proves_dropped:
             return
         self.logger().warning(
             f"{operation_name}: transaction {signature} still not found after "
@@ -1055,7 +1074,7 @@ class GatewayBase(ConnectorBase):
         match = _TIMEOUT_SIGNATURE_PATTERN.search(error_str)
         return match.group(1) if match else None
 
-    async def _await_signature_terminal(self, signature: str, operation_name: str) -> str:
+    async def _await_signature_terminal(self, signature: str, operation_name: str, proves_dropped: bool) -> str:
         """
         Poll a broadcast-but-unconfirmed signature to a terminal state.
 
@@ -1105,7 +1124,7 @@ class GatewayBase(ConnectorBase):
         # Deadline reached, so the blockhash has expired: a signature the cluster still
         # does not know can never land now, and exactly one fresh submission is safe.
         if not_found_streak >= self.SIGNATURE_NOT_FOUND_STRIKES:
-            if self.not_found_proves_dropped:
+            if proves_dropped:
                 self.logger().info(
                     f"{operation_name}: transaction {signature} still unknown to the cluster after "
                     f"{poll_timeout:.0f}s (blockhash expired); it can no longer land."
@@ -1333,10 +1352,13 @@ class GatewayBase(ConnectorBase):
                     if (self.current_timestamp - tracked_order.creation_timestamp > self.tx_not_found_deadline
                             and tracked_order.client_order_id not in self._unresolved_not_found_warned):
                         self._unresolved_not_found_warned.add(tracked_order.client_order_id)
+                        tx_data = tx_details.get("txData")
+                        note = tx_data.get("note") if isinstance(tx_data, dict) else None
                         self.logger().network(
                             f"Transaction {tracked_order.exchange_order_id} for order {tracked_order.client_order_id} is not "
                             f"found by Gateway. On {self._chain}-{self._network} that does not prove it can no longer land, "
-                            "so the order stays open. Check it on-chain before trading this intent again.",
+                            "so the order stays open. Check it on-chain before trading this intent again."
+                            + (f" Gateway says: {note}" if note else ""),
                             app_warning_msg=f"Swap {tracked_order.client_order_id} unresolved: {tracked_order.exchange_order_id}",
                         )
                     continue

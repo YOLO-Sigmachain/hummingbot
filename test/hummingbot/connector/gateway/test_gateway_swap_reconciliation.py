@@ -1,8 +1,10 @@
 import asyncio
 import itertools
+import json
 import random
+import time
 import unittest
-from decimal import ROUND_FLOOR, Decimal, localcontext
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -11,7 +13,8 @@ from hummingbot.client.settings import AllConnectorSettings
 from hummingbot.connector.gateway import gateway_base
 from hummingbot.connector.gateway.gateway import Gateway
 from hummingbot.connector.gateway.gateway_base import GatewayBase
-from hummingbot.core.data_type.common import TradeType
+from hummingbot.connector.gateway.gateway_in_flight_order import GatewayInFlightOrder
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
 from hummingbot.core.event.event_logger import EventLogger
 from hummingbot.core.event.events import MarketEvent
@@ -689,6 +692,493 @@ class GatewaySwapPriceLimitTest(GatewaySwapTestBase):
         self.assertEqual(OrderState.FAILED, self.connector.get_order("sell-1").current_state)
         self.assertIn("1e15 or more", self.connector.order_failure_reason("sell-1"))
         self.gateway.execute_swap.assert_not_awaited()
+
+
+class GatewaySwapCoarseTokenLimitTest(GatewaySwapTestBase):
+    """A quote token with few decimals binds the swap to the order's price and slippage exactly.
+
+    A pool pays, and takes, whole units of the quote token. So a SELL's minimum rounded up
+    to the token's unit, and a BUY's maximum rounded down, pass every fill the slippage
+    allows and refuse every fill worse than it. Rounding the other way would let through
+    a fill one unit worse than the trader's slippage setting.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.connector._token_data["SigUSD"] = {"symbol": "SigUSD", "address": "03" * 32, "decimals": 2}
+        self.connector._token_data["SigRSV"] = {"symbol": "SigRSV", "address": "00" + "03" * 31, "decimals": 0}
+
+    def _limit(self, trade_type: TradeType, pair: str, amount: str, price: str, slippage=None):
+        return self.connector._swap_price_limit(trade_type, pair, Decimal(amount), Decimal(price), slippage)
+
+    def test_a_two_decimal_token_admits_no_fill_worse_than_the_slippage(self):
+        # 1 ERG at 0.16 SigUSD with 1%: at least 0.1584. The pool can pay only 0.15 or 0.16,
+        # and 0.15 is 6.25% under the price, so the minimum sent is 0.16. Likewise at most
+        # 0.1616: the pool takes 0.16 or 0.17, and 0.17 is 6.25% over, so the maximum is 0.16.
+        self.assertEqual({"min_amount_out": Decimal("0.16")}, self._limit(TradeType.SELL, "ERG-SigUSD", "1", "0.16", 1))
+        self.assertEqual({"max_amount_in": Decimal("0.16")}, self._limit(TradeType.BUY, "ERG-SigUSD", "1", "0.16", 1))
+
+    def test_a_token_with_no_decimals_admits_no_fill_worse_than_the_slippage(self):
+        # 2 ERG at 1234.5678 SigRSV with 1%: at least 2444.444244. The pool pays whole SigRSV,
+        # and 2444 is under that, so the minimum sent is 2445. At most 2493.826956, so 2493.
+        self.assertEqual({"min_amount_out": Decimal("2445")}, self._limit(TradeType.SELL, "ERG-SigRSV", "2", "1234.5678", 1))
+        self.assertEqual({"max_amount_in": Decimal("2493")}, self._limit(TradeType.BUY, "ERG-SigRSV", "2", "1234.5678", 1))
+
+    def test_a_limit_already_on_the_tokens_unit_is_sent_as_it_is(self):
+        # 10 at 100 with 0.5%: exactly 995 and 1005.
+        self.assertEqual({"min_amount_out": Decimal("995")}, self._limit(TradeType.SELL, "ERG-SigRSV", "10", "100", 0.5))
+        self.assertEqual({"max_amount_in": Decimal("1005")}, self._limit(TradeType.BUY, "ERG-SigRSV", "10", "100", 0.5))
+
+    def test_no_whole_unit_fill_the_limit_admits_is_worse_than_the_slippage(self):
+        # Random orders whose exact limit has at most 12 significant digits, so the only
+        # rounding is to the token's unit.
+        rng = random.Random(5)
+        for _ in range(3000):
+            decimals = rng.choice((0, 2, 9))
+            self.connector._token_data["Q"] = {"symbol": "Q", "decimals": decimals}
+            amount = Decimal(rng.randint(1, 9999)).scaleb(-rng.randint(0, 2))
+            price = Decimal(rng.randint(1, 9999)).scaleb(-rng.randint(0, 2))
+            slippage = rng.choice((0, 0.25, 0.5, 1, 2.5, 5))
+            scale = Decimal(10) ** decimals
+            with localcontext() as context:
+                context.prec = 100
+                low = amount * price * (100 - Decimal(str(slippage))) / 100
+                high = amount * price * (100 + Decimal(str(slippage))) / 100
+                # The fills, in whole units, that the slippage allows at its edge.
+                best_allowed_out = (low * scale).to_integral_value(rounding=ROUND_CEILING)
+                best_allowed_in = (high * scale).to_integral_value(rounding=ROUND_FLOOR)
+            case = (decimals, amount, price, slippage)
+
+            sell = self.connector._swap_price_limit(TradeType.SELL, "B-Q", amount, price, slippage)["min_amount_out"]
+            # The pool's output passes when it is at least the minimum, so the worst output
+            # it admits is the minimum itself, in whole units.
+            worst_out = sell * scale
+            self.assertEqual(worst_out, worst_out.to_integral_value(), case)
+            self.assertGreaterEqual(worst_out / scale, low, case)
+            self.assertLessEqual(worst_out, best_allowed_out, case)
+
+            try:
+                buy = self.connector._swap_price_limit(TradeType.BUY, "B-Q", amount, price, slippage)["max_amount_in"]
+            except ValueError:
+                # Less than one unit of the quote token: no whole-unit input is within the slippage.
+                self.assertEqual(0, best_allowed_in, case)
+                continue
+            worst_in = buy * scale
+            self.assertEqual(worst_in, worst_in.to_integral_value(), case)
+            self.assertLessEqual(worst_in / scale, high, case)
+            self.assertGreaterEqual(worst_in, best_allowed_in, case)
+
+    async def test_the_limit_sent_with_a_swap_admits_no_fill_worse_than_the_slippage(self):
+        self.poll_status = 1
+        await self.connector._create_order(
+            TradeType.SELL, "sell-sigusd", "ERG-SigUSD", Decimal("1"), Decimal("0.16"), slippage_pct=1.0)
+
+        self.assertEqual(Decimal("0.16"), self.gateway.execute_swap.await_args.kwargs["min_amount_out"])
+
+
+PENDING_SELL = {
+    "tokenIn": "RSN", "tokenOut": "ERG", "amountIn": 100, "amountOut": 2.3301, "fee": 0.0012,
+    "baseTokenBalanceChange": -100, "quoteTokenBalanceChange": 2.3289, "slippagePct": 1,
+}
+
+
+class GatewaySwapPendingDataTest(GatewaySwapTestBase):
+    """A swap answered PENDING with the amounts its transaction fixes is booked from them once poll confirms it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.gateway.execute_swap = AsyncMock(
+            return_value={"signature": TX_ID, "status": 0, "pendingData": dict(PENDING_SELL)})
+
+    def _assert_booked_from_the_pending_data(self, order):
+        self.assertEqual(OrderState.FILLED, order.current_state)
+        self.assertEqual(1, len(self.filled_logger.event_log))
+        fill = self.filled_logger.event_log[0]
+        self.assertEqual(Decimal("100"), fill.amount)
+        self.assertEqual(Decimal("0.023301"), fill.price)
+        self.assertEqual("ERG", fill.trade_fee.flat_fees[0].token)
+        self.assertEqual(Decimal("0.0012"), fill.trade_fee.flat_fees[0].amount)
+        self.assertEqual(Decimal("2.3301"), order.executed_amount_quote)
+
+    async def test_a_swap_confirmed_by_the_status_loop_is_booked_from_the_amounts_its_transaction_fixes(self):
+        order = await self._place_sell()
+        self.assertTrue(order.is_open)
+        await self._run_status_loop(0)
+        self.assertTrue(order.is_open)
+        self.assertEqual(0, len(self.filled_logger.event_log))
+
+        await self._run_status_loop(1)
+        self._assert_booked_from_the_pending_data(order)
+        self.assertEqual(1, self.gateway.execute_swap.await_count)
+
+    async def test_a_swap_confirmed_by_its_own_poll_is_booked_from_the_amounts_its_transaction_fixes(self):
+        self.poll_status = 1
+        order = await self._place_sell()
+        await self._run_status_loop(1)
+        await self._run_status_loop(1)
+
+        self._assert_booked_from_the_pending_data(order)
+
+    async def test_a_buy_is_booked_from_the_amounts_its_transaction_fixes(self):
+        self.gateway.execute_swap = AsyncMock(return_value={"signature": TX_ID, "status": 0, "pendingData": {
+            "tokenIn": "ERG", "tokenOut": "RSN", "amountIn": 2.3512, "amountOut": 100, "fee": 0.0011,
+        }})
+        await self.connector._create_order(TradeType.BUY, "buy-1", self.PAIR, Decimal("100"), Decimal("0.0234"))
+        await self._settle()
+        await self._run_status_loop(1)
+
+        fill = self.filled_logger.event_log[0]
+        self.assertEqual(Decimal("100"), fill.amount)
+        self.assertEqual(Decimal("0.023512"), fill.price)
+        self.assertEqual(Decimal("2.3512"), self.connector.get_order("buy-1").executed_amount_quote)
+
+    async def test_nothing_is_booked_from_the_amounts_until_poll_confirms(self):
+        order = await self._place_sell()
+        await self._run_status_loop(-2)
+        await self._run_status_loop(0)
+        self.assertTrue(order.is_open)
+        self.assertEqual(0, len(self.filled_logger.event_log))
+
+        await self._run_status_loop(-1)
+        self.assertEqual(OrderState.FAILED, order.current_state)
+        self.assertEqual(0, len(self.filled_logger.event_log))
+
+    async def test_amounts_sent_for_another_transaction_are_not_used(self):
+        order = await self._place_sell()
+        order.pending_swap_data = ("ab" * 32, dict(PENDING_SELL))
+        await self._run_status_loop(1)
+
+        self.assertEqual(Decimal("0.0234"), self.filled_logger.event_log[0].price)
+
+    async def test_amounts_that_cannot_be_read_leave_the_order_booked_at_its_price(self):
+        for amount_out in (0, None, "x"):
+            self.filled_logger.clear()
+            self.gateway.execute_swap = AsyncMock(return_value={
+                "signature": TX_ID, "status": 0, "pendingData": dict(PENDING_SELL, amountOut=amount_out)})
+            await self._place_sell(order_id=f"sell-{amount_out}")
+            await self._run_status_loop(1)
+            self.assertEqual(Decimal("0.0234"), self.filled_logger.event_log[0].price, amount_out)
+
+    async def _saved_while_pending(self) -> dict:
+        """Place the swap and return its tracking state as saved while it was pending, through JSON."""
+        saved_states = []
+
+        async def poll(chain, network, tx_hash, fail_silently=False):
+            saved_states.append(self.connector.tracking_states)
+            return {"signature": tx_hash, "txStatus": 0, "fee": 0.0011}
+
+        self.gateway.get_transaction_status = AsyncMock(side_effect=poll)
+        await self._place_sell()
+        return json.loads(json.dumps(saved_states[0]))
+
+    async def _book_after_a_restart(self, saved_state: dict) -> EventLogger:
+        restarted = Gateway(
+            connector_name="ergo-mainnet", chain="ergo", network="mainnet", address="9-wallet",
+            trading_pairs=[self.PAIR], trading_required=True,
+        )
+        restarted._native_currency = "ERG"
+        restarted._read_network_timing({"blockTimeSeconds": 120, "confirmations": 1, "nativeDecimals": 9})
+        restarted.restore_tracking_states(saved_state)
+        filled = EventLogger()
+        restarted.add_listener(MarketEvent.OrderFilled, filled)
+        self.gateway.get_transaction_status = AsyncMock(side_effect=self._poll)
+        self.poll_status = 1
+        await restarted.update_order_status(restarted.gateway_orders)
+        await self._settle()
+
+        self.assertEqual(OrderState.FILLED, restarted.get_order("sell-1").current_state)
+        self.assertEqual(1, len(filled.event_log))
+        return filled
+
+    async def test_after_a_restart_the_order_is_booked_from_the_amounts_its_transaction_fixes(self):
+        saved_state = await self._saved_while_pending()
+        self.assertEqual([TX_ID, PENDING_SELL], saved_state["sell-1"]["pending_swap_data"])
+
+        fill = (await self._book_after_a_restart(saved_state)).event_log[0]
+        self.assertEqual(Decimal("100"), fill.amount)
+        self.assertEqual(Decimal("0.023301"), fill.price)
+        self.assertEqual("ERG", fill.trade_fee.flat_fees[0].token)
+        self.assertEqual(Decimal("0.0012"), fill.trade_fee.flat_fees[0].amount)
+
+    async def test_an_order_saved_without_the_amounts_is_booked_at_its_price_after_a_restart(self):
+        # As an older client saved it.
+        saved_state = await self._saved_while_pending()
+        del saved_state["sell-1"]["pending_swap_data"]
+
+        self.assertEqual(Decimal("0.0234"), (await self._book_after_a_restart(saved_state)).event_log[0].price)
+
+    async def test_saved_amounts_of_the_wrong_shape_are_not_restored(self):
+        saved_state = await self._saved_while_pending()
+        for bad in ("x", [TX_ID], [TX_ID, PENDING_SELL, 1], [1, PENDING_SELL], [TX_ID, "x"], {"a": 1}, None):
+            order = GatewayInFlightOrder.from_json(dict(saved_state["sell-1"], pending_swap_data=bad))
+            self.assertIsNone(order.pending_swap_data, bad)
+        self.assertEqual((TX_ID, PENDING_SELL), GatewayInFlightOrder.from_json(saved_state["sell-1"]).pending_swap_data)
+
+    def test_an_order_without_amounts_is_saved_as_before(self):
+        order = GatewayInFlightOrder(
+            client_order_id="sell-1", trading_pair=self.PAIR, order_type=OrderType.LIMIT, trade_type=TradeType.SELL,
+            creation_timestamp=1640000000.0, price=Decimal("0.0234"), amount=Decimal("100"),
+        )
+        self.assertNotIn("pending_swap_data", order.to_json())
+        self.assertIsNone(GatewayInFlightOrder.from_json(order.to_json()).pending_swap_data)
+
+
+class GatewaySwapPendingDataLogTest(GatewaySwapTestBase):
+    """What is logged when a swap booked from the amounts its transaction fixes is confirmed by its own poll."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.gateway.execute_swap = AsyncMock(
+            return_value={"signature": TX_ID, "status": 0, "pendingData": dict(PENDING_SELL)})
+
+    async def _poll(self, chain, network, tx_hash, fail_silently=False):
+        # The swap's own poll asks with fail_silently; the status loop does not.
+        status = self.inner_status if fail_silently else self.poll_status
+        return {"signature": tx_hash, "txStatus": status, "fee": 0.0011}
+
+    def _messages(self, log) -> str:
+        return "\n".join(str(call.args[0]) for call in log.call_args_list)
+
+    async def test_a_swap_its_own_poll_confirms_first_logs_that_its_fill_is_booked_from_those_amounts(self):
+        self.inner_status = 1
+        with patch.object(self.connector.logger(), "warning") as warning, \
+                patch.object(self.connector.logger(), "info") as info:
+            order = await self._place_sell()
+
+        self.assertNotIn("no realized amounts", self._messages(warning))
+        self.assertNotIn("not recoverable", self._messages(warning))
+        self.assertIn("is not available on this path", self._messages(warning))
+        self.assertIn(f"Swap sell-1 confirmed on {TX_ID}; its fill is booked from the amounts its transaction fixes",
+                      self._messages(info))
+        self.assertTrue(order.is_open)
+        await self._run_status_loop(1)
+        self.assertEqual(Decimal("0.023301"), self.filled_logger.event_log[0].price)
+
+    async def test_a_swap_the_status_loop_filled_during_its_own_poll_logs_that_it_is_resolved(self):
+        self.connector.SIGNATURE_POLL_TIMEOUT = 5.0
+        self.inner_status = 0
+        with patch.object(self.connector.logger(), "warning") as warning, \
+                patch.object(self.connector.logger(), "info") as info:
+            task = asyncio.ensure_future(self.connector._create_order(
+                TradeType.SELL, "sell-1", self.PAIR, Decimal("100"), Decimal("0.0234")))
+            for _ in range(1000):
+                await asyncio.sleep(0.001)
+                if self.connector.get_order("sell-1") is not None and self.connector.get_order("sell-1").exchange_order_id:
+                    break
+            await self._run_status_loop(1)
+            self.assertEqual(OrderState.FILLED, self.connector.get_order("sell-1").current_state)
+            self.inner_status = 1
+            await asyncio.wait_for(task, timeout=5)
+            await self._settle()
+
+        self.assertNotIn("no realized amounts", self._messages(warning))
+        self.assertNotIn("stays open", self._messages(warning))
+        self.assertIn(f"Swap sell-1 confirmed on {TX_ID}; the order-status loop has already resolved it.",
+                      self._messages(info))
+        self.assertEqual(1, len(self.filled_logger.event_log))
+        self.assertEqual(Decimal("0.023301"), self.filled_logger.event_log[0].price)
+
+
+class GatewaySwapPriceLimitConnectorsTest(GatewaySwapTestBase):
+    """Which connectors are sent a price limit: the built-in set, and any Gateway states binds one."""
+
+    CONNECTORS = {"connectors": [
+        {"name": "ergodex", "trading_types": ["amm"], "chain": "ergo", "networks": ["mainnet"],
+         "binds_price_limit": False},
+        {"name": "lithos", "trading_types": ["amm"], "chain": "ergo", "networks": ["mainnet"],
+         "binds_price_limit": True},
+        {"name": "raydium", "trading_types": ["amm", "clmm"], "chain": "solana", "networks": ["mainnet-beta"]},
+    ]}
+
+    async def _sell_on(self, provider: str) -> dict:
+        self.connector._swap_provider = provider
+        self.poll_status = 1
+        order_id = f"sell-{provider.split('/')[0]}-{self.gateway.execute_swap.await_count}"
+        await self._place_sell(order_id=order_id, slippage_pct=1.0)
+        self.assertNotEqual(OrderState.FAILED, self.connector.get_order(order_id).current_state)
+        return self.gateway.execute_swap.await_args.kwargs
+
+    async def test_gateway_can_add_a_connector_to_the_built_in_set_but_not_remove_one(self):
+        self.gateway.get_connectors = AsyncMock(return_value=self.CONNECTORS)
+        await self.connector._read_price_limit_connectors()
+
+        self.assertEqual(Decimal("2.316600000"), (await self._sell_on("lithos/amm"))["min_amount_out"])
+        # Gateway states false for ergodex: it keeps its limit.
+        self.assertEqual(Decimal("2.316600000"), (await self._sell_on("ergodex/amm"))["min_amount_out"])
+        self.assertNotIn("min_amount_out", await self._sell_on("raydium/amm"))
+        # Read once: no later swap asks again.
+        self.assertEqual(1, self.gateway.get_connectors.await_count)
+
+    async def test_a_gateway_that_states_nothing_leaves_the_built_in_set(self):
+        silent = {"connectors": [{k: v for k, v in c.items() if k != "binds_price_limit"}
+                                 for c in self.CONNECTORS["connectors"]]}
+        self.gateway.get_connectors = AsyncMock(return_value=silent)
+        await self.connector._read_price_limit_connectors()
+
+        self.assertEqual(Decimal("2.316600000"), (await self._sell_on("ergodex/amm"))["min_amount_out"])
+        self.assertNotIn("min_amount_out", await self._sell_on("lithos/amm"))
+
+    async def test_a_list_that_cannot_be_read_leaves_the_built_in_set(self):
+        for answer in (AsyncMock(side_effect=asyncio.TimeoutError()), AsyncMock(return_value={}),
+                       AsyncMock(return_value={"connectors": "none"})):
+            self.gateway.get_connectors = answer
+            await self.connector._read_price_limit_connectors()
+            self.assertIsNone(self.connector._price_limit_connectors)
+        self.connector._last_connectors_attempt = time.time()
+
+        self.assertEqual(Decimal("2.316600000"), (await self._sell_on("ergodex/amm"))["min_amount_out"])
+        self.assertNotIn("min_amount_out", await self._sell_on("lithos/amm"))
+
+    async def test_a_swap_never_waits_for_the_list(self):
+        released = asyncio.Event()
+
+        async def slow_connectors(fail_silently=False):
+            await released.wait()
+            return self.CONNECTORS
+
+        self.gateway.get_connectors = AsyncMock(side_effect=slow_connectors)
+        # Not read yet: the swap starts a read and goes out with the built-in set.
+        self.assertEqual(Decimal("2.316600000"), (await self._sell_on("ergodex/amm"))["min_amount_out"])
+        self.gateway.get_connectors.assert_awaited_once()
+        released.set()
+        await self._settle()
+
+        self.assertEqual({"ergodex": False, "lithos": True}, self.connector._price_limit_connectors)
+        self.assertEqual(Decimal("2.316600000"), (await self._sell_on("lithos/amm"))["min_amount_out"])
+
+    async def test_several_swaps_in_one_tick_start_one_read(self):
+        self.gateway.get_connectors = AsyncMock(return_value=self.CONNECTORS)
+        self.poll_status = 1
+        await asyncio.gather(*(
+            self.connector._create_order(TradeType.SELL, f"sell-{i}", self.PAIR, Decimal("100"), Decimal("0.0234"))
+            for i in range(5)
+        ))
+        await self._settle()
+
+        self.assertEqual(5, self.gateway.execute_swap.await_count)
+        self.assertEqual(1, self.gateway.get_connectors.await_count)
+
+    async def test_start_network_reads_the_list(self):
+        self.gateway.get_connectors = AsyncMock(return_value=self.CONNECTORS)
+        with patch.object(GatewayBase, "start_network", AsyncMock()) as base_start:
+            await self.connector.start_network()
+
+        base_start.assert_awaited_once()
+        self.gateway.get_connectors.assert_awaited_once_with(fail_silently=True)
+        self.assertEqual({"ergodex": False, "lithos": True}, self.connector._price_limit_connectors)
+
+
+class GatewaySwapTransactionsExpireTest(GatewaySwapTestBase):
+    """A network config's `transactionsExpire` can rule out re-submitting a transaction not found, never allow it."""
+
+    def _dropped_then_confirmed(self):
+        self.gateway.execute_swap = AsyncMock(side_effect=[
+            {"signature": "sig-1", "status": 0},
+            {"signature": "sig-2", "status": 1, "data": {"amountIn": 100, "amountOut": 2.33}},
+        ])
+        self.poll_status = -2
+
+    async def test_a_network_that_publishes_block_timing_never_re_submits_though_it_says_they_expire(self):
+        self.connector._read_network_timing(
+            {"blockTimeSeconds": 0.001, "confirmations": 1, "nativeDecimals": 9, "transactionsExpire": True})
+        self._dropped_then_confirmed()
+        order = await self._place_sell()
+
+        self.assertEqual(1, self.gateway.execute_swap.await_count)
+        self.assertTrue(order.is_open)
+        self.assertEqual("sig-1", order.exchange_order_id)
+
+    async def test_a_network_that_states_they_never_expire_never_re_submits(self):
+        # No block timing, which alone would allow one re-submission.
+        self.connector._read_network_timing({"nativeDecimals": 9, "transactionsExpire": False})
+        self._dropped_then_confirmed()
+        order = await self._place_sell()
+
+        self.assertEqual(1, self.gateway.execute_swap.await_count)
+        self.assertTrue(order.is_open)
+        self.assertEqual("sig-1", order.exchange_order_id)
+
+
+class GatewaySwapNotSubmittedTest(GatewaySwapTestBase):
+    """A swap Gateway says it never submitted fails as an ordinary failure, safe to place again."""
+
+    def _refused(self, status: int, message: str) -> GatewayError:
+        return GatewayError(f"Failed to execute ergodex swap: {message}", status=status, http_error="HttpError")
+
+    async def _assert_failed_as_never_sent(self, error: GatewayError, words: str):
+        self.gateway.execute_swap = AsyncMock(side_effect=error)
+        order = await self._place_sell()
+
+        self.assertEqual(OrderState.FAILED, order.current_state)
+        self.assertIsNone(order.exchange_order_id)
+        reason = self.connector.order_failure_reason("sell-1")
+        self.assertIn(words, reason)
+        self.assertNotIn("SUBMIT_OUTCOME_UNKNOWN", reason)
+        self.assertEqual(1, self.gateway.execute_swap.await_count)
+        self.gateway.get_transaction_status.assert_not_awaited()
+
+    async def test_a_swap_gateway_says_was_not_submitted_fails_as_never_sent(self):
+        await self._assert_failed_as_never_sent(self._refused(503, (
+            f"Transaction {TX_ID} was not submitted: the node could not be reached (connect ECONNREFUSED "
+            "127.0.0.1:9053); nothing was sent, so it cannot confirm. Retry once the node is reachable")),
+            "was not submitted")
+
+    async def test_a_swap_the_node_refused_at_its_first_submit_fails_as_never_sent(self):
+        await self._assert_failed_as_never_sent(self._refused(400, (
+            "Ergo node rejected the transaction (400): Malformed transaction")), "rejected")
+
+
+class GatewaySwapPollNoteTest(GatewaySwapTestBase):
+    """An answer that is not final, with Gateway's note, leaves the swap open on its hash."""
+
+    async def test_a_swap_whose_input_another_transaction_spent_stays_open_until_poll_says_failed(self):
+        note = ("input 3c is spent by transaction 7d, which has 1 of the 3 confirmations that make it final; "
+                "this transaction can no longer confirm once that one is final")
+
+        async def poll(chain, network, tx_hash, fail_silently=False):
+            return {"signature": tx_hash, "txStatus": self.poll_status, "fee": None, "txData": {"note": note}}
+
+        self.gateway.get_transaction_status = AsyncMock(side_effect=poll)
+        order = await self._place_sell()
+        await self._run_status_loop(0)
+        self.assertTrue(order.is_open)
+        self.assertEqual(TX_ID, order.exchange_order_id)
+
+        await self._run_status_loop(-1)
+        self.assertEqual(OrderState.FAILED, order.current_state)
+        self.assertEqual(1, self.gateway.execute_swap.await_count)
+
+
+class GatewayNativeCoinSizeStepTest(unittest.IsolatedAsyncioTestCase):
+    """The native coin in Gateway's token list gives it a size step, with no other change."""
+
+    def tearDown(self) -> None:
+        AllConnectorSettings.get_connector_settings().pop("ergo-mainnet", None)
+        super().tearDown()
+
+    async def test_the_native_coin_in_the_token_list_gives_its_decimals(self):
+        connector = Gateway(
+            connector_name="ergo-mainnet", chain="ergo", network="mainnet", address="9-wallet",
+            trading_pairs=["ERG-rsBTC"], trading_required=False,
+        )
+        gateway = MagicMock()
+        gateway.get_tokens = AsyncMock(return_value={"tokens": [
+            {"symbol": "ERG", "name": "Ergo", "address": "0" * 64, "decimals": 9},
+            {"symbol": "SigUSD", "name": "SigmaUSD", "address": "03" * 32, "decimals": 2},
+            {"symbol": "rsBTC", "name": "Rosen BTC", "address": "5a" * 32, "decimals": 8},
+        ]})
+        with patch("hummingbot.connector.gateway.gateway_base.GatewayHttpClient.get_instance", return_value=gateway):
+            await connector.load_token_data()
+
+        self.assertEqual(Decimal("1e-9"), connector._amount_quantum_dict["ERG"])
+        # The step of a pair is the coarser of its two tokens' units, as on every chain.
+        self.assertEqual(Decimal("1e-8"), connector.get_order_size_quantum("ERG-rsBTC", Decimal("1")))
+        self.assertEqual(Decimal("1.23456789"), connector.quantize_order_amount("ERG-rsBTC", Decimal("1.234567891")))
+        self.assertEqual(Decimal("0.01"), connector.get_order_size_quantum("ERG-SigUSD", Decimal("1")))
+        # Its decimals are found without the network config.
+        self.assertIsNone(connector._native_decimals)
+        self.assertEqual(9, connector._token_decimals("ERG"))
+        self.assertEqual(9, connector._token_decimals("0" * 64))
 
 
 if __name__ == "__main__":
