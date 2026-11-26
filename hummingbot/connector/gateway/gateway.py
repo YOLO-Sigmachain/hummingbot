@@ -11,6 +11,7 @@ Architecture:
 """
 
 import asyncio
+import re
 import time
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, InvalidOperation, localcontext
 from typing import Any, Dict, List, Optional, Union
@@ -44,6 +45,11 @@ from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
 # `binds_price_limit: true` for it in /config/connectors. A stated false never removes one
 # of these: a limit sent to a connector that ignores it costs nothing.
 PRICE_LIMIT_DEXES = frozenset({"ergodex"})
+
+# Gateway's refusal of an AMM deposit or redeem whose pool moved past the request's bound
+# (answered 409, with no code): nothing that can still execute was submitted.
+POOL_MOVED_REFUSAL = re.compile(
+    r"The pool moved: .*Nothing that can still execute was submitted; retry with a fresh quote\.$", re.DOTALL)
 
 
 class TokenInfo(BaseModel):
@@ -85,7 +91,7 @@ class AMMPositionDetail(BaseModel):
     remove-liquidity / add-liquidity need this address to name one of them.
     """
     position_address: str = Field(alias="positionAddress")
-    lp_token_amount: float = Field(alias="lpTokenAmount")
+    lp_token_amount: Decimal = Field(alias="lpTokenAmount")
     base_token_amount: float = Field(alias="baseTokenAmount")
     quote_token_amount: float = Field(alias="quoteTokenAmount")
 
@@ -95,7 +101,7 @@ class AMMPositionInfo(BaseModel):
     wallet_address: str = Field(alias="walletAddress")
     base_token_address: str = Field(alias="baseTokenAddress")
     quote_token_address: str = Field(alias="quoteTokenAddress")
-    lp_token_amount: float = Field(alias="lpTokenAmount")
+    lp_token_amount: Decimal = Field(alias="lpTokenAmount")
     base_token_amount: float = Field(alias="baseTokenAmount")
     quote_token_amount: float = Field(alias="quoteTokenAmount")
     price: float
@@ -1361,8 +1367,9 @@ class Gateway(GatewayBase):
         slippage_pct: Optional[float] = None,
         position_address: Optional[str] = None,
         max_retries: int = 10,
+        pool_address: Optional[str] = None,
     ):
-        """Opens a regular AMM liquidity position."""
+        """Opens a regular AMM liquidity position, in `pool_address` or else the pair's listed pool."""
         tokens = trading_pair.split("-")
         if len(tokens) != 2:
             raise ValueError(f"Invalid trading pair format: {trading_pair}")
@@ -1377,12 +1384,13 @@ class Gateway(GatewayBase):
                                   amount=Decimal(str(total_amount_in_base)),
                                   order_type=OrderType.AMM_ADD)
 
-        pool_address = await self.get_pool_address(trading_pair, dex_name=dex_name, trading_type=trading_type)
+        if not pool_address:
+            pool_address = await self.get_pool_address(trading_pair, dex_name=dex_name, trading_type=trading_type)
         if not pool_address:
             raise ValueError(f"Could not find pool for {trading_pair}")
 
         async def execute_add_liquidity() -> Dict[str, Any]:
-            return await self._get_gateway_instance().amm_add_liquidity(
+            result = await self._get_gateway_instance().amm_add_liquidity(
                 network=self.network,
                 chain=self.chain,
                 wallet_address=self.address,
@@ -1394,6 +1402,8 @@ class Gateway(GatewayBase):
                 slippage_pct=slippage_pct,
                 position_address=position_address,
             )
+            self._keep_pending_lp_data(order_id, result)
+            return result
 
         try:
             # Same chokepoint as the CLMM verbs: a status 0 (broadcast, unconfirmed) or
@@ -1413,7 +1423,7 @@ class Gateway(GatewayBase):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self._handle_operation_failure(order_id, trading_pair, "opening AMM position", e)
+            self._handle_operation_failure(order_id, trading_pair, "opening AMM position", self._lp_submit_error(e))
 
     def remove_liquidity(
         self,
@@ -1635,9 +1645,16 @@ class Gateway(GatewayBase):
         position_address: Optional[str] = None,
         fail_silently: bool = False,
         max_retries: int = 10,
+        pool_address: Optional[str] = None,
+        slippage_pct: Optional[float] = None,
+        lp_token_amount: Optional[Decimal] = None,
     ):
-        """Removes liquidity from an AMM pool."""
-        pool_address = await self.get_pool_address(trading_pair, dex_name=dex_name, trading_type=trading_type)
+        """Removes liquidity from an AMM pool: `pool_address`, or else the pair's listed pool.
+
+        With `lp_token_amount`, exactly those LP tokens are returned and `percentage` is not sent.
+        """
+        if not pool_address:
+            pool_address = await self.get_pool_address(trading_pair, dex_name=dex_name, trading_type=trading_type)
         if not pool_address:
             raise ValueError(f"Could not find pool for {trading_pair}")
 
@@ -1647,7 +1664,7 @@ class Gateway(GatewayBase):
                                   order_type=OrderType.AMM_REMOVE)
 
         async def execute_remove_liquidity() -> Dict[str, Any]:
-            return await self._get_gateway_instance().amm_remove_liquidity(
+            result = await self._get_gateway_instance().amm_remove_liquidity(
                 network=self.network,
                 chain=self.chain,
                 wallet_address=self.address,
@@ -1656,8 +1673,12 @@ class Gateway(GatewayBase):
                 dex=dex_name,
                 trading_type=trading_type,
                 position_address=position_address,
-                fail_silently=fail_silently
+                fail_silently=fail_silently,
+                slippage_pct=slippage_pct,
+                lp_token_amount=lp_token_amount,
             )
+            self._keep_pending_lp_data(order_id, result)
+            return result
 
         try:
             # Same chokepoint as the CLMM verbs — see _clmm_remove_liquidity.
@@ -1675,7 +1696,50 @@ class Gateway(GatewayBase):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self._handle_operation_failure(order_id, trading_pair, "closing AMM position", e)
+            self._handle_operation_failure(order_id, trading_pair, "closing AMM position", self._lp_submit_error(e))
+
+    def _keep_pending_lp_data(self, order_id: str, result: Any):
+        """Keep, with the order, the amounts an AMM add or remove answer says its transaction moves.
+
+        A PENDING answer's `pendingData`, or a CONFIRMED answer's `data` (the same names), as for
+        a swap (see _keep_pending_swap_data): with the transaction's signature, and read only by a
+        caller the connector has returned that transaction to as confirmed. A PENDING answer
+        without `pendingData` keeps the signature alone, so the transaction can be named while it
+        is polled. Kept whatever the order's done state: a remove is tracked with amount 0, which
+        already counts as done.
+        """
+        if not isinstance(result, dict):
+            return
+        signature, status = result.get("signature"), result.get("status")
+        if status == 0:
+            stated = result.get("pendingData") if isinstance(result.get("pendingData"), dict) else {}
+        elif status == 1 and isinstance(result.get("data"), dict):
+            stated = result["data"]
+        else:
+            return
+        tracked = self._order_tracker.fetch_tracked_order(order_id)
+        if signature and tracked is not None:
+            tracked.pending_swap_data = (signature, dict(stated))
+
+    def _lp_submit_error(self, error: Exception) -> Exception:
+        """The failure to record for an AMM liquidity request, marked when Gateway may have submitted it.
+
+        The rule a swap follows (see _create_order): a request that failed on the way to or from
+        Gateway, on a network where a transaction never expires, may have been submitted, and
+        must not be sent again before someone checks the chain.
+
+        Gateway refuses a deposit or redeem whose pool moved past the request's bound with a 409
+        that carries no code; that refusal, and only it, is marked as the slippage failure it is,
+        so a wider tolerance can be tried. Nothing that can still execute was submitted for it.
+        """
+        if (isinstance(error, (aiohttp.ClientError, asyncio.TimeoutError))
+                and not isinstance(error, aiohttp.ClientConnectorError)
+                and not self.not_found_proves_dropped):
+            return Exception(f"{error!r} [code: SUBMIT_OUTCOME_UNKNOWN]")
+        if (isinstance(error, GatewayError) and error.status == 409 and not error.code
+                and POOL_MOVED_REFUSAL.match(error.message or "")):
+            return Exception(f"{error} [code: SLIPPAGE_EXCEEDED]")
+        return error
 
     @async_ttl_cache(ttl=5, maxsize=10)
     async def get_position_info(

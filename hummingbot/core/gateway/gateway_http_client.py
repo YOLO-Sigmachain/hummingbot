@@ -109,6 +109,31 @@ def _query(request: Any) -> Dict[str, str]:
     }
 
 
+# The largest whole number a JSON number carries exactly to Gateway, and the most significant
+# digits of one with a fraction.
+JSON_MAX_EXACT_INTEGER = 2 ** 53 - 1
+JSON_MAX_EXACT_DIGITS = 15
+
+
+def exact_json_number(value: Decimal) -> Optional[Union[int, float]]:
+    """`value` as a JSON number Gateway reads exactly, written without an exponent; None when it has none.
+
+    A whole number up to 2^53-1 is sent as an integer. One with a fraction is sent when it has
+    at most 15 significant digits and its float writes out as exactly those digits.
+    """
+    if not value.is_finite() or value <= 0:
+        return None
+    if value == value.to_integral_value():
+        return int(value) if value <= JSON_MAX_EXACT_INTEGER else None
+    if len(value.normalize().as_tuple().digits) > JSON_MAX_EXACT_DIGITS:
+        return None
+    number = float(value)
+    written = repr(number)
+    if "e" in written or "E" in written or Decimal(written) != value:
+        return None
+    return number
+
+
 def _body(request: Any) -> Dict[str, Any]:
     """A request model as a JSON body.
 
@@ -1667,6 +1692,8 @@ class GatewayHttpClient:
         position_address: Optional[str] = None,
         chain: Optional[str] = None,
         fail_silently: bool = False,
+        slippage_pct: Optional[float] = None,
+        lp_token_amount: Optional[Decimal] = None,
     ) -> Dict[str, Any]:
         """
         Closes an existing AMM liquidity position.
@@ -1683,6 +1710,10 @@ class GatewayHttpClient:
                 hold several per pool; ignored by fungible-LP AMMs.
             chain: Chain name; combined with a short network to form the "chain-network" the endpoint requires.
             fail_silently: If True, suppress errors
+            slippage_pct: Maximum slippage percentage; omitted, the connector's configured one applies
+            lp_token_amount: The exact LP tokens to return, sent as lpTokenAmount instead of
+                percentageToRemove (exactly one of the two is sent). A Gateway without it answers 400.
+                Refused here when it cannot be sent as an exact JSON number (see exact_json_number).
         """
         request_payload = _body(
             AmmRemoveRequest(
@@ -1692,8 +1723,17 @@ class GatewayHttpClient:
                 poolAddress=pool_address,
                 percentageToRemove=percentage,
                 positionAddress=position_address,
+                slippagePct=slippage_pct,
             )
         )
+        if lp_token_amount is not None:
+            # Not in the generated request model yet. A JSON number, as _body sends every amount,
+            # and only one Gateway reads exactly (see exact_json_number); the percentage is omitted.
+            number = exact_json_number(Decimal(str(lp_token_amount)))
+            if number is None:
+                raise ValueError(f"lpTokenAmount {lp_token_amount} cannot be sent as an exact JSON number")
+            request_payload.pop("percentageToRemove", None)
+            request_payload["lpTokenAmount"] = number
 
         return await self.api_request(
             "post",

@@ -1,6 +1,6 @@
 # Fork notes: Hummingbot client changes for Gateway on Ergo
 
-This branch (`feat/ergo`) is Hummingbot v2.18.0 (upstream commit `3351adad0`) plus two commits: `89ab848da` and `669886ac1`. They change how the client's Gateway connector waits for, tracks and books swaps. The fork exists to be used with the Gateway fork that adds an Ergo chain (`feat/ergo` of the Gateway repository; see its `FORK-NOTES.md`).
+This branch (`feat/ergo`) is Hummingbot v2.18.0 (upstream commit `3351adad0`) plus the commits on this branch. The first two (`89ab848da`, `669886ac1`) change how the client's Gateway connector waits for, tracks and books swaps; a later one gives the LP executor an AMM mode (section 2.1). The fork exists to be used with the Gateway fork that adds an Ergo chain (`feat/ergo` of the Gateway repository; see its `FORK-NOTES.md`).
 
 This file is for someone who wants to run the client with that Gateway, or merge a new upstream release into this fork.
 
@@ -25,6 +25,17 @@ The commits change both rules, add `ergo` to the client's chain list, send a pri
 - **Booking from `pendingData`.** If Gateway answers a swap PENDING with `pendingData`, the client keeps those amounts, with the transaction's signature, on the open order (saved with the order, so it survives a client restart). Nothing is booked from them until poll reports that same transaction confirmed. Then the fill is booked from those amounts and fee. A Gateway that sends none is handled as before.
 - **Orders with no usable price.** The client asks Gateway for a quote alongside the submission and books a confirmed fill at that quote, or at price 0 with an error logged if none arrived. It used to book NaN.
 - **Other.** `cancel()` on a Gateway swap order logs a warning and returns; the order stays open. A swap still unresolved when its own poll ends keeps the order open on its hash. `transactionsExpire: false` forbids re-submission and never allows one the older rule would not. The re-submission rule is read once per swap, before its first submit.
+
+## 2.1 The LP executor on AMM pools
+
+Upstream's LP executor manages concentrated-liquidity (CLMM) positions only. This fork adds an AMM mode, chosen when the executor's `lp_provider` has trading type `amm` (for example `ergodex/amm`). CLMM behaviour is unchanged.
+
+- **A position** is the LP tokens one deposit acquired, in one pool. There is no price range; a config that sets `lower_price` or `upper_price` in AMM mode is refused. Fees accrue inside the pool's reserves, so there is nothing to collect; the fee fields are zero and volume is derived from the growth of the position as for CLMM.
+- **Open and close.** Open is one Gateway AMM add. With a Gateway that states what a liquidity transaction moves (`pendingData` on a pending answer, or `data` when confirmed), the position's LP is exact and its close removes exactly that LP (`lpTokenAmount`). With a Gateway that does not, amounts are estimated from readings of the wallet's holding before and after, the close is by percentage, the estimates are labelled in the executor's info, and another movement of the same pool's LP in the wallet can be counted as this position's.
+- **Exits.** `upper_limit_price` and `lower_limit_price` close the position once the price has stayed past the limit for at least one block time (the chain's `blockTimeSeconds`, or `position_refresh_interval` where it is unknown). A deposit is refused when the price is already past a limit.
+- **One executor per pool.** In one client process, one AMM executor per chain, network, wallet and pool (the pool id in any case); a second refuses to start and says why. The claim is given up only on a clean end. It stays held while a transaction of the executor may still land or its LP is still in the pool (an unknown or unmeasured deposit, a forced stop, a withdrawal of unknown outcome, a pool that cannot pay in full, a percentage close that left a residue). Release it by hand with `LPExecutor.release_amm_pool_claim(chain, network, wallet_address, pool_address)` after checking the wallet on chain. Actions outside this process on the same wallet are not covered.
+- **Never twice, never orphaned.** A deposit is not sent after an early stop, not sent again when its outcome is unknown, and not booked from the offer. An unknown deposit is followed for `blockTimeSeconds x (confirmations + 10)` (22 minutes on Ergo mainnet), polled by its transaction id, and booked exactly once it confirms; without a verdict it ends in a hold. The unclosed-position marker in the executor's stored info carries the pool, the LP amount (or the reading before the deposit), and the transaction hashes, also on a forced stop.
+- **The LP rebalancer** controller stays CLMM-only and refuses an AMM provider.
 
 ## 3. What stays identical for Solana and Ethereum, and what does not
 

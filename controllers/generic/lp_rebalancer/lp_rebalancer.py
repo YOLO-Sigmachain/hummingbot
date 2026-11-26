@@ -135,6 +135,17 @@ class LPRebalancerConfig(ControllerConfigBase):
         raise ValueError(f"Invalid side type {type(v)}. Must be TradeType, str, or int")
 
     @model_validator(mode="after")
+    def validate_lp_provider_has_ranges(self):
+        """Refuse an AMM pool: this controller places and rebalances price ranges, which an AMM
+        position does not have. The LP executor can hold an AMM pool share on its own."""
+        if self.lp_provider.partition("/")[2] == "amm":
+            raise ValueError(
+                f"lp_provider '{self.lp_provider}' is an AMM pool, which has no price ranges to place or "
+                "rebalance; lp_rebalancer needs a CLMM provider (e.g. 'meteora/clmm')"
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_price_limit_ranges(self):
         """Validate that price limit ranges are valid."""
         if self.buy_price_max is not None and self.buy_price_min is not None:

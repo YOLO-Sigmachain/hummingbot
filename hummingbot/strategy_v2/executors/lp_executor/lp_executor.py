@@ -1,13 +1,15 @@
+import asyncio
 import logging
-from decimal import Decimal
-from typing import Dict, List, Optional, Union
+import re
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
+from typing import Dict, List, Optional, Tuple, Union
 
-from hummingbot.connector.gateway.gateway import AMMPoolInfo, CLMMPoolInfo
+from hummingbot.connector.gateway.gateway import AMMPoolInfo, AMMPositionInfo, CLMMPoolInfo
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.event.events import RangePositionLiquidityAddedEvent, RangePositionLiquidityRemovedEvent
-from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient
+from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient, exact_json_number
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
@@ -24,6 +26,21 @@ from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
 # Default native currency fallback when connector doesn't have _native_currency set
 DEFAULT_NATIVE_CURRENCY = "SOL"
+
+# Markers of a liquidity request that may have reached the chain without the client learning
+# its outcome. Such a request is never sent again: a second add or remove could land beside it.
+OUTCOME_UNKNOWN_MARKERS = ("[code: TX_UNRESOLVED]", "[code: SUBMIT_OUTCOME_UNKNOWN]")
+# A transaction the connector gave up on after its submissions. Its outcome is unknown only
+# where NOT_FOUND does not prove a transaction can no longer land (not_found_proves_dropped).
+DROPPED_MARKER = "TRANSACTION_TIMEOUT"
+
+# Gateway's refusal (400) of an AMM remove the pool cannot pay in full, which names the most LP
+# tokens that can be removed now, or says none can.
+AMM_CANNOT_PAY_REFUSAL = "can be removed now"
+AMM_MOST_REMOVABLE = re.compile(r"at most ([0-9]+(?:\.[0-9]+)?) LP tokens")
+
+# Gateway reads an AMM remove's percentageToRemove to 8 decimal places.
+AMM_PERCENT_QUANTUM = Decimal("0.00000001")
 
 
 class LPExecutor(ExecutorBase):
@@ -42,6 +59,23 @@ class LPExecutor(ExecutorBase):
     without the Clock/tick mechanism (like hummingbot-api).
     """
     _logger: Optional[HummingbotLogger] = None
+
+    # AMM only, for the whole process: which executor holds each (chain, network, wallet, pool),
+    # the hold reason of one that stopped and kept it, and a lock held from the reading before
+    # through the reading after of every AMM add and remove on it. See _amm_claim_pool.
+    _amm_pool_claims: Dict[Tuple[str, str, str, str], str] = {}
+    _amm_pool_claim_reasons: Dict[Tuple[str, str, str, str], Optional[str]] = {}
+    _amm_pool_locks: Dict[Tuple[str, str, str, str], asyncio.Lock] = {}
+    # AMM only: the fewest readings, one position_refresh_interval apart, that look for the LP of
+    # an add that was sent but could not be booked, before the executor holds with the marker.
+    AMM_OPEN_REREADS = 10
+    # AMM only: on a network whose block time the connector knows, such an add is followed until
+    # this many blocks beyond the confirmations it needs have passed since it was sent.
+    AMM_OPEN_FOLLOW_BLOCKS = 10
+    # AMM only: hold reasons under which an add or remove of this executor may still land, or its
+    # LP is still in the pool. The claim on the pool stays held until it is released by hand.
+    AMM_CLAIM_KEPT_REASONS = ("open_outcome_unknown", "open_unmeasured", "forced_stop_in_flight",
+                              "forced_stop_lp_in_pool", "close_outcome_unknown", "pool_cannot_pay_in_full")
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -108,6 +142,34 @@ class LPExecutor(ExecutorBase):
         self._swap_failure_count: int = 0
         # Parse lp_provider into dex_name and trading_type for gateway calls
         self.lp_dex_name, self.lp_trading_type = parse_provider(config.lp_provider)
+        # An "amm" trading type makes the position a share of a constant-product pool. See
+        # _amm_create_position; every CLMM path below is left as it was.
+        self._is_amm = self.lp_trading_type == "amm"
+        self.lp_position_state.has_price_range = not self._is_amm
+        # AMM only: the wallet's LP balance in the pool read right before this executor's add,
+        # which measures the LP the add acquired when Gateway's answer does not state it.
+        self._amm_lp_before_open: Optional[Decimal] = None
+        # AMM only: the reason an add may still confirm, when its outcome was never learned.
+        self._amm_open_outcome_unknown: Optional[str] = None
+        self._warned_lp_shortfall = False
+        # AMM only: the (chain, network, wallet, pool) this executor holds; see _amm_claim_pool.
+        self._amm_pool_key: Optional[Tuple[str, str, str, str]] = None
+        # AMM only: whether Gateway stated the LP the add acquired, so the close returns exactly
+        # that; and whether the amounts booked at open and at close are estimates from readings.
+        self._amm_lp_exact = False
+        self._amm_open_estimated = False
+        self._amm_close_estimated = False
+        # AMM only: an add that was sent and may hold LP, but is not booked yet. "kind" is
+        # "unmeasured" (it confirmed) or "outcome_unknown"; with its order id, signature, the
+        # readings left and the time until which it is followed before the executor holds with
+        # the marker. See _amm_try_book_open and _amm_reread_unbooked_open.
+        self._amm_unbooked_open: Optional[Dict] = None
+        # AMM only: the limit the last position reading showed the price past, when that reading
+        # was taken, and whether a later one, at least one block (or position_refresh_interval)
+        # later, showed it too. See _amm_note_limit_reading.
+        self._amm_limit_crossing: Optional[Tuple[str, float, bool]] = None
+        # AMM only: the most LP Gateway said the pool can pay for now, when it refused the remove.
+        self._amm_most_removable: Optional[Decimal] = None
 
     def _validate_and_normalize_connector(self, connector_name: str) -> Optional[str]:
         """
@@ -141,6 +203,9 @@ class LPExecutor(ExecutorBase):
             f"Using LP provider: {self.config.lp_provider} "
             f"(dex={self.lp_dex_name}, type={self.lp_trading_type})"
         )
+
+        if self._is_amm and not self._amm_claim_pool():
+            return
 
         # Resolve swap_provider up front when the config already expects to unwind,
         # so a missing provider surfaces at start instead of mid-close-out.
@@ -263,6 +328,9 @@ class LPExecutor(ExecutorBase):
             direction = "below lower limit"
         else:
             return
+        if self._is_amm and not self._amm_limit_held(direction):
+            # One reading of one pool is not enough to withdraw on: see _amm_note_limit_reading.
+            return
 
         self.logger().info(
             f"Price {self._current_price} {direction} "
@@ -279,6 +347,10 @@ class LPExecutor(ExecutorBase):
 
         connector = self.connectors.get(self.config.connector_name)
         if connector is None:
+            return
+
+        if self._is_amm:
+            await self._amm_update_position_info(connector)
             return
 
         try:
@@ -364,6 +436,10 @@ class LPExecutor(ExecutorBase):
         if connector is None:
             self.logger().error(f"Connector {self.config.connector_name} not found")
             self._handle_create_failure(ValueError(f"Connector {self.config.connector_name} not found"))
+            return
+
+        if self._is_amm:
+            await self._amm_create_position(connector)
             return
 
         # Use config bounds directly
@@ -604,6 +680,875 @@ class LPExecutor(ExecutorBase):
                 return False
         return True
 
+    # ------------------------------------------------------------------------------------
+    # AMM pool share
+    #
+    # On an AMM (constant-product) pool a position has no range and no account of its own: it
+    # is the LP tokens this executor's add acquired, in one pool, and position_address holds
+    # the pool's address. The wallet may hold more LP of the same pool (an earlier deposit, a
+    # manual one); none of that is this position's. Fees accrue inside the reserves, so there
+    # is nothing to collect: base_fee and quote_fee stay 0, and the fees show in base_amount
+    # and quote_amount.
+    #
+    # One AMM executor in this process holds a (chain, network, wallet, pool) at a time (see
+    # _amm_claim_pool). Nothing here sees what happens outside this process: another bot or a
+    # manual add or remove on the same wallet and pool.
+    #
+    # Amounts are booked only once the connector returns the transaction as confirmed, from
+    # what Gateway's answer stated (a PENDING answer's `pendingData`, or a confirmed answer's
+    # `data`), kept with the order. When the add's answer states the LP it acquired, the
+    # position is exact: its close returns exactly that LP (lpTokenAmount), and only it is
+    # removed. Otherwise the LP is measured as the growth of the wallet's confirmed LP of the
+    # pool between a reading before and after the add, and the close removes a percentage of
+    # the wallet's LP. Gateway takes that percentage of the LP the wallet can spend, including
+    # unconfirmed transactions, while the reading counts confirmed LP only. So anything else
+    # moving the wallet's LP of the pool between the readings, or while the remove waits to
+    # confirm, can make such a close take LP that is not this position's, or leave some of its
+    # own. Amounts worked out from readings are estimates, and are reported as such.
+
+    @staticmethod
+    def _amm_claim_key(chain, network, wallet_address, pool_address) -> Tuple[str, str, str, str]:
+        """The claim key of a pool: the chain, network and wallet, and the pool id in lower case
+        (Gateway reads pool ids in any case), so two spellings of one pool are one key."""
+        return str(chain), str(network), str(wallet_address), str(pool_address).lower()
+
+    @classmethod
+    def release_amm_pool_claim(cls, chain: str, network: str, wallet_address: str, pool_address: str) -> Optional[str]:
+        """Release the claim on one pool, for the person running the bot, and return the executor that held it.
+
+        An AMM executor that stopped while an add or remove of its own may still land, or with LP
+        of its own still in the pool, keeps the claim for the rest of the process, so no other AMM
+        executor deposits into or removes from that pool and wallet beside it. Call this only
+        after checking the wallet's transactions and LP of the pool on chain, for example from a
+        script or the Python console of the running bot. Returns None when nothing held it.
+        """
+        key = cls._amm_claim_key(chain, network, wallet_address, pool_address)
+        holder = cls._amm_pool_claims.pop(key, None)
+        reason = cls._amm_pool_claim_reasons.pop(key, None)
+        if holder is not None:
+            cls.logger().warning(
+                f"Releasing the claim of AMM executor {holder} (hold_reason={reason}) on pool {key[3]} for wallet "
+                f"{key[2]} on {key[0]}-{key[1]}: another AMM executor may now deposit into or remove from it."
+            )
+        return holder
+
+    def _amm_claim_pool(self) -> bool:
+        """Claim this executor's (chain, network, wallet, pool) for the process, or refuse to run.
+
+        Gateway's remove and the wallet's position read count the wallet's LP of a pool, not an
+        executor's, so two AMM executors on one pool and wallet cannot tell their LP apart. A
+        second one ends FAILED, as for a config it cannot run, before it sends anything. The key
+        comes from the connector's chain and network, not its name, so two connector names for
+        one wallet are one key. The claim is released by stop() only when nothing of this
+        executor's is or may still get into the pool (see _amm_release_pool), and otherwise by
+        hand (see release_amm_pool_claim).
+        """
+        if self._amm_pool_key is not None:
+            return True
+        connector = self.connectors.get(self.config.connector_name)
+        key = self._amm_claim_key(getattr(connector, "chain", ""), getattr(connector, "network", ""),
+                                  getattr(connector, "address", ""), self.config.pool_address)
+        holder = LPExecutor._amm_pool_claims.setdefault(key, self.config.id)
+        if holder != self.config.id:
+            stopped = key in LPExecutor._amm_pool_claim_reasons
+            reason = LPExecutor._amm_pool_claim_reasons.get(key)
+            self.logger().error(
+                f"AMM executor {holder} already holds pool {key[3]} for wallet {key[2]} on {key[0]}-{key[1]} "
+                f"({f'it stopped with hold_reason={reason}' if stopped else 'it is still running'}). This executor "
+                "could not tell its LP apart from that one's, so it does not run; nothing was sent. Once the "
+                "wallet's transactions and LP of this pool have been checked on chain, the claim can be released "
+                f"with LPExecutor.release_amm_pool_claim({key[0]!r}, {key[1]!r}, {key[2]!r}, {key[3]!r})."
+            )
+            self.lp_position_state.state = LPExecutorStates.FAILED
+            self.close_type = CloseType.FAILED
+            self.stop()
+            return False
+        self._amm_pool_key = key
+        return True
+
+    def _amm_pool_lock(self) -> asyncio.Lock:
+        """The lock held from the reading before through the reading after of an add or remove.
+
+        Anything else in this process that takes it for the same key waits for it; nothing
+        outside this process does.
+        """
+        return LPExecutor._amm_pool_locks.setdefault(self._amm_pool_key, asyncio.Lock())
+
+    def _amm_lp_at_stake(self) -> bool:
+        """Whether LP of this executor's may be in the pool: a position, an add or remove still
+        awaited, or an add that was sent and is not booked."""
+        state = self.lp_position_state
+        return bool(state.position_address or state.active_open_order is not None
+                    or state.active_close_order is not None or self._amm_unbooked_open is not None)
+
+    def _amm_marker_written(self) -> bool:
+        return any(order.get("lp_unclosed_position") for order in self._held_position_orders)
+
+    def _amm_release_pool(self):
+        """Give up the claim on the pool on a clean end only: nothing sent, or a confirmed close that left nothing.
+
+        While an add or remove of this executor's may still land, or LP of its own is still in
+        the pool (a hold, or a close by percentage that left a residue), the claim stays held for
+        the rest of the process, marker or not: a second executor would deposit beside an add that
+        may still confirm, or take this executor's LP as its own. It is then released by hand.
+        """
+        key = self._amm_pool_key
+        if key is None or LPExecutor._amm_pool_claims.get(key) != self.config.id:
+            return
+        if (self._amm_lp_at_stake() or self.lp_position_state.lp_token_residue > 0
+                or self._hold_reason in self.AMM_CLAIM_KEPT_REASONS):
+            LPExecutor._amm_pool_claim_reasons[key] = self._hold_reason
+            self.logger().warning(
+                f"Keeping the claim on pool {key[3]} for wallet {key[2]} on {key[0]}-{key[1]} "
+                f"(hold_reason={self._hold_reason}, lp_token_residue={self.lp_position_state.lp_token_residue}): "
+                "an add or remove of this executor's may still land, or LP of its own is still in the pool, so no "
+                "other AMM executor in this process may use the pool and wallet. Check the wallet on chain, then "
+                f"release it with LPExecutor.release_amm_pool_claim({key[0]!r}, {key[1]!r}, {key[2]!r}, {key[3]!r})."
+            )
+            return
+        del LPExecutor._amm_pool_claims[key]
+        LPExecutor._amm_pool_claim_reasons.pop(key, None)
+
+    def stop(self):
+        super().stop()
+        if self._is_amm:
+            self._amm_release_pool()
+
+    def _amm_limit_direction(self, price: Optional[Decimal]) -> Optional[str]:
+        """The limit `price` is past, in _check_limit_prices' words, or None."""
+        if price is None:
+            return None
+        if self.config.upper_limit_price is not None and price >= self.config.upper_limit_price:
+            return "above upper limit"
+        if self.config.lower_limit_price is not None and price <= self.config.lower_limit_price:
+            return "below lower limit"
+        return None
+
+    @staticmethod
+    def _amm_block_time(connector) -> Optional[float]:
+        """The network's block time in seconds as the connector read it from Gateway, or None if it does not know it."""
+        block_time = getattr(connector, "_block_time_seconds", None)
+        if isinstance(block_time, (int, float)) and not isinstance(block_time, bool) and block_time > 0:
+            return float(block_time)
+        return None
+
+    def _amm_note_limit_reading(self, now: float, connector=None):
+        """Record what a position reading at `now` says about the limits.
+
+        A limit closes an AMM position only once the readings show the price past it without a
+        break from a first reading to one at least one block time later (position_refresh_interval
+        where the connector knows no block time, and never less than that). One pool's price can be
+        pushed past a limit for a block by anyone willing to pay two pool fees, and a close
+        followed by a close-out swap at that price is theirs to profit from; two readings of the
+        same confirmed pool box are one reading of it. Gateway's pool and position info name no
+        pool box, so the readings are told apart by the time between them only.
+        """
+        direction = self._amm_limit_direction(self._current_price)
+        crossing = self._amm_limit_crossing
+        spacing = max(self.config.position_refresh_interval, self._amm_block_time(connector) or 0.0)
+        if direction is None:
+            self._amm_limit_crossing = None
+        elif crossing is None or crossing[0] != direction:
+            self._amm_limit_crossing = (direction, now, False)
+        elif now - crossing[1] >= spacing:
+            self._amm_limit_crossing = (direction, crossing[1], True)
+
+    def _amm_limit_held(self, direction: str) -> bool:
+        """Whether the price has stayed past this limit over two readings (see _amm_note_limit_reading)."""
+        crossing = self._amm_limit_crossing
+        return crossing is not None and crossing[0] == direction and crossing[2]
+
+    async def _read_amm_holding(self, connector) -> Optional[AMMPositionInfo]:
+        """The wallet's whole holding in the pool, read fresh. None when Gateway says it holds none."""
+        return await connector.get_position_info_fresh(
+            trading_pair=self.config.trading_pair,
+            dex_name=self.lp_dex_name,
+            trading_type=self.lp_trading_type,
+            position_address=self.config.pool_address,
+        )
+
+    @staticmethod
+    def _held_lp(holding: Optional[AMMPositionInfo]) -> Decimal:
+        """The LP tokens of the pool a holding reading counts, 0 for none."""
+        return Decimal(str(holding.lp_token_amount)) if holding is not None else Decimal("0")
+
+    @staticmethod
+    def _share_of(holding: AMMPositionInfo, lp: Decimal) -> Tuple[Decimal, Decimal]:
+        """What `lp` of the LP in a holding reading is worth, in base and quote, at that reading."""
+        held = Decimal(str(holding.lp_token_amount))
+        if held <= 0:
+            return Decimal("0"), Decimal("0")
+        return (Decimal(str(holding.base_token_amount)) * lp / held,
+                Decimal(str(holding.quote_token_amount)) * lp / held)
+
+    @staticmethod
+    def _is_outcome_unknown(reason: str, proves_dropped: bool) -> bool:
+        """Whether a failure says the request may have reached the chain all the same.
+
+        A transaction the connector gave up on as dropped counts only where NOT_FOUND does not
+        prove it can no longer land. `proves_dropped` is the connector's not_found_proves_dropped,
+        read once before the request was sent, as the connector's own retry loop reads it.
+        """
+        if any(marker in reason for marker in OUTCOME_UNKNOWN_MARKERS):
+            return True
+        return DROPPED_MARKER in reason and not proves_dropped
+
+    @staticmethod
+    def _proves_dropped(connector) -> bool:
+        """The connector's not_found_proves_dropped; anything but True is read as False."""
+        return getattr(connector, "not_found_proves_dropped", False) is True
+
+    @staticmethod
+    def _amm_order_signature(connector, order_id: Optional[str], reason: Optional[str] = None) -> Optional[str]:
+        """The transaction an AMM add or remove was sent as, when the client knows it.
+
+        The connector keeps it with the order from Gateway's answer. A failure that names a
+        transaction ("Transaction <id> ...") is read when the order does not have it.
+        """
+        order = connector.get_order(order_id) if order_id else None
+        kept = getattr(order, "pending_swap_data", None)
+        if isinstance(kept, (tuple, list)) and len(kept) == 2 and isinstance(kept[0], str) and kept[0]:
+            return kept[0]
+        match = re.search(r"Transaction ([0-9A-Za-z]+)", reason or "")
+        return match.group(1) if match else None
+
+    def _amm_pending_amounts(self, connector, order_id: str, signature: str, operation: str) -> Dict[str, Decimal]:
+        """The amounts Gateway's answer to a confirmed AMM add or remove states, by what they measure.
+
+        The connector keeps a PENDING answer's `pendingData`, or a CONFIRMED answer's `data`,
+        with the order and the signature it came with, and returns the signature only once that
+        transaction is confirmed. The keys read are `baseTokenAmountAdded`,
+        `quoteTokenAmountAdded` and `lpTokenAmountAdded` for an add, `baseTokenAmountRemoved`,
+        `quoteTokenAmountRemoved` and `lpTokenAmountRemoved` for a remove, and `fee`; numbers or
+        strings. A `poolAddress` other than this executor's pool, in any case, discards them all. A key that is
+        missing or not a finite amount (an LP amount above 0) is left out, and the caller
+        works that amount out from the pool holding instead.
+        """
+        order = connector.get_order(order_id)
+        kept = getattr(order, "pending_swap_data", None)
+        if (not isinstance(kept, (tuple, list)) or len(kept) != 2
+                or kept[0] != signature or not isinstance(kept[1], dict)):
+            return {}
+        stated_pool = kept[1].get("poolAddress")
+        if stated_pool is not None and str(stated_pool).lower() != self.config.pool_address.lower():
+            self.logger().warning(
+                f"Gateway's answer for {signature} names pool {kept[1].get('poolAddress')}, not "
+                f"{self.config.pool_address}: its amounts are not used.")
+            return {}
+        suffix = "Added" if operation == "add" else "Removed"
+        keys = {"base": f"baseTokenAmount{suffix}", "quote": f"quoteTokenAmount{suffix}",
+                "lp": f"lpTokenAmount{suffix}", "fee": "fee"}
+        amounts = {}
+        for name, key in keys.items():
+            value = kept[1].get(key)
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                value = Decimal(str(value))
+            except (InvalidOperation, ValueError):
+                continue
+            if value.is_finite() and value >= 0 and (name != "lp" or value > 0):
+                amounts[name] = value
+        return amounts
+
+    def _amm_position_lp(self, held: Decimal) -> Decimal:
+        """This position's LP among the `held` LP the wallet holds now, 0 when there is none."""
+        lp = self.lp_position_state.lp_token_amount
+        if lp <= 0 or held <= 0:
+            return Decimal("0")
+        if held < lp:
+            if not self._warned_lp_shortfall:
+                self._warned_lp_shortfall = True
+                self.logger().warning(
+                    f"The wallet holds {held} LP of pool {self.config.pool_address}, less than the {lp} this "
+                    "position acquired: some of it left the wallet outside this executor."
+                )
+            return held
+        return lp
+
+    def _amm_position_record(self) -> Dict:
+        """What this executor holds, or may hold, in the pool: for the unclosed-position marker and custom info."""
+        state = self.lp_position_state
+        unmeasured = self._amm_unbooked_open is not None or (
+            state.active_open_order is not None and state.position_address is None)
+        record = {
+            "pool_address": self.config.pool_address,
+            "lp_token_amount": "unmeasured" if unmeasured else str(state.lp_token_amount),
+            "lp_token_amount_exact": self._amm_lp_exact,
+            "open_tx_hash": state.open_tx_hash,
+            "close_tx_hash": state.close_tx_hash,
+        }
+        if unmeasured:
+            record["offered_base_amount"] = str(self.config.base_amount)
+            record["offered_quote_amount"] = str(self.config.quote_amount)
+            # What whoever recovers the add by hand needs: the wallet's LP of the pool before it,
+            # its order, and the LP Gateway's answer stated for its transaction, when it was kept.
+            unbooked = self._amm_unbooked_open or {}
+            order_id = unbooked.get("order_id") or (
+                state.active_open_order.order_id if state.active_open_order is not None else None)
+            record["lp_before_open"] = (str(self._amm_lp_before_open)
+                                        if self._amm_lp_before_open is not None else None)
+            record["open_order_id"] = order_id
+            connector = self.connectors.get(self.config.connector_name)
+            signature = state.open_tx_hash
+            stated = (self._amm_pending_amounts(connector, order_id, signature, "add").get("lp")
+                      if connector is not None and order_id and signature else None)
+            record["stated_lp_token_amount"] = str(stated) if stated is not None else None
+            if signature is None and self._amm_open_outcome_unknown is not None:
+                record["open_tx_note"] = (
+                    "the add's reply was lost; its transaction id is unknown; check the wallet's recent "
+                    f"transactions for a deposit into pool {self.config.pool_address}")
+        return record
+
+    async def _amm_create_position(self, connector):
+        """Add the configured amounts to the pool; the position is the LP tokens the add acquires."""
+        if self._amm_unbooked_open is not None:
+            # An add was sent and is not booked: look for its LP again, and never send another.
+            await self._amm_reread_unbooked_open(connector)
+            return
+        if self._close_after_open:
+            # early_stop() came while no add had been sent (a failed reading or a refused add left
+            # the state at OPENING), so there is nothing to close and nothing is sent.
+            self.logger().info("early_stop before the AMM add was sent: not sending it.")
+            self.lp_position_state.active_open_order = None
+            self.lp_position_state.state = LPExecutorStates.COMPLETE
+            return
+        if not self._amm_claim_pool():
+            return
+        async with self._amm_pool_lock():
+            await self._amm_add(connector)
+
+    async def _amm_add(self, connector):
+        """Read the wallet's holding in the pool, send the add, and book it once it is known."""
+        pool_address = self.config.pool_address
+        try:
+            before = await self._read_amm_holding(connector)
+        except Exception as e:
+            # Nothing was sent. Without this reading the LP the add acquires could not be told
+            # apart from LP the wallet already holds, so the add waits for the next tick; the
+            # retry budget ends a reading that keeps failing.
+            self._current_retries += 1
+            self.logger().warning(
+                f"Reading the wallet's holding in pool {pool_address} before the AMM add failed "
+                f"({self._current_retries}/{self._max_retries} retries used): {e}"
+            )
+            return
+        lp_before = self._held_lp(before)
+        self._amm_lp_before_open = lp_before
+        if before is not None:
+            self._current_price = Decimal(str(before.price))
+        price = self._current_price or Decimal("0")
+        beyond = self._amm_limit_direction(price) if price > 0 else None
+        if beyond is not None:
+            # The position would be withdrawn again as soon as it is read.
+            self._handle_create_failure(ValueError(
+                f"The price of pool {pool_address} ({price}) is already {beyond} (upper_limit="
+                f"{self.config.upper_limit_price}, lower_limit={self.config.lower_limit_price}); the AMM add is not sent"
+            ))
+            return
+
+        order_id = connector.create_market_order_id(TradeType.RANGE, self.config.trading_pair)
+        self.lp_position_state.active_open_order = TrackedOrder(order_id=order_id)
+        self.logger().info(
+            f"Adding at most {self.config.base_amount} base and {self.config.quote_amount} quote to AMM pool "
+            f"{pool_address} (order_id={order_id}); the wallet holds {lp_before} LP of it before the add"
+        )
+        proves_dropped = self._proves_dropped(connector)
+        sent_at = self._strategy.current_timestamp
+        try:
+            # Returns the signature only once the transaction is confirmed (a PENDING answer is
+            # polled to a final state first), and None on a failure, which it records on the order.
+            signature = await connector._amm_add_liquidity(
+                trade_type=TradeType.RANGE,
+                order_id=order_id,
+                trading_pair=self.config.trading_pair,
+                price=float(price),
+                base_token_amount=float(self.config.base_amount),
+                quote_token_amount=float(self.config.quote_amount),
+                dex_name=self.lp_dex_name,
+                trading_type=self.lp_trading_type,
+                slippage_pct=float(self._slippage_pct),
+                max_retries=self._max_retries,
+                pool_address=pool_address,
+            )
+        except Exception as e:
+            # Raised only before anything was sent.
+            self._handle_create_failure(e)
+            return
+
+        kind = "unmeasured"
+        if not signature:
+            reason = connector.order_failure_reason(order_id) or "AMM add liquidity failed"
+            if not self._is_outcome_unknown(reason, proves_dropped):
+                self._handle_create_failure(ValueError(reason))
+                return
+            # It may still confirm. It is never sent again, and the executor never ends FAILED
+            # for it: a controller that re-creates an executor after FAILED would deposit twice.
+            kind = "outcome_unknown"
+            self._amm_open_outcome_unknown = reason
+            signature = self._amm_order_signature(connector, order_id, reason)
+        follow_until = self._amm_open_follow_until(connector, sent_at)
+        if kind == "outcome_unknown":
+            self.logger().error(
+                f"The AMM add on pool {pool_address} may still confirm ({reason}). It is not sent again; it is "
+                f"followed until {follow_until:.0f} ({follow_until - sent_at:.0f}s after it was sent), by its "
+                "transaction's status when its id is known and by the wallet's LP of the pool, and then this "
+                "executor holds with the unclosed-position marker."
+            )
+        self.lp_position_state.active_open_order = None
+        self.lp_position_state.open_tx_hash = signature
+        self._amm_unbooked_open = {"kind": kind, "order_id": order_id, "signature": signature,
+                                   "reads_left": self.AMM_OPEN_REREADS, "follow_until": follow_until}
+        await self._amm_book_or_wait(connector)
+
+    def _amm_open_follow_until(self, connector, sent_at: float) -> float:
+        """Until when an add sent at `sent_at` that is not booked is followed before the executor holds.
+
+        As long as it can still land: the blocks the connector's confirmation needs plus
+        AMM_OPEN_FOLLOW_BLOCKS more, when the connector knows the block time, and never less than
+        AMM_OPEN_REREADS readings.
+        """
+        least = sent_at + self.AMM_OPEN_REREADS * self.config.position_refresh_interval
+        block_time = self._amm_block_time(connector)
+        if block_time is None:
+            return least
+        confirmations = getattr(connector, "_block_confirmations", 1)
+        if not isinstance(confirmations, int) or isinstance(confirmations, bool) or confirmations < 1:
+            confirmations = 1
+        return max(least, sent_at + block_time * (confirmations + self.AMM_OPEN_FOLLOW_BLOCKS))
+
+    async def _amm_open_verdict(self, connector, signature: str) -> Optional[int]:
+        """The add's transaction status by its signature, as the connector polls it: 1 confirmed,
+        -1 failed, anything else (or a poll that failed) None."""
+        try:
+            poll = await connector._get_gateway_instance().get_transaction_status(
+                connector.chain, connector.network, signature, fail_silently=True)
+        except Exception as e:
+            self.logger().warning(f"Polling the AMM add {signature} on pool {self.config.pool_address} failed: {e}")
+            return None
+        status = poll.get("txStatus") if isinstance(poll, dict) else None
+        return status if status in (1, -1) else None
+
+    async def _amm_reread_unbooked_open(self, connector):
+        """Follow an add that was sent and is not booked; hold once it has been followed as long as it can land.
+
+        An add whose outcome is unknown is polled by its transaction id when that is known, as the
+        connector polls it. Confirmed: it is booked as a confirmed add, from the amounts Gateway's
+        answer stated for it when they were kept, else from the readings. Failed: nothing landed,
+        and the open fails with nothing booked. Otherwise, and without an id, the wallet's LP of the
+        pool is read for it.
+        """
+        now = self._strategy.current_timestamp
+        if not self._is_position_refresh_due(now):
+            return
+        self._last_position_refresh_timestamp = now
+        unbooked = self._amm_unbooked_open
+        unbooked["reads_left"] -= 1
+        if unbooked["kind"] == "outcome_unknown" and unbooked["signature"]:
+            verdict = await self._amm_open_verdict(connector, unbooked["signature"])
+            if verdict == 1:
+                unbooked["kind"] = "unmeasured"
+            elif verdict == -1:
+                self._amm_unbooked_open = None
+                self._handle_create_failure(ValueError(
+                    f"The AMM add {unbooked['signature']} on pool {self.config.pool_address} failed on-chain: "
+                    "nothing was deposited"))
+                return
+        async with self._amm_pool_lock():
+            if await self._amm_book_or_wait(connector):
+                return
+        if unbooked["reads_left"] <= 0 and now >= unbooked["follow_until"]:
+            self._amm_hold_unbooked_open()
+
+    async def _amm_book_or_wait(self, connector) -> bool:
+        """Book the add that was sent, if what it acquired is now known. False while it is not."""
+        try:
+            return await self._amm_try_book_open(connector)
+        except Exception as e:
+            if self.lp_position_state.position_address:
+                # Booked, and something after it failed: the position is live (see _handle_create_failure).
+                self._handle_create_failure(e)
+                return True
+            self.logger().error(f"Booking the AMM add on pool {self.config.pool_address} failed: {e}")
+            return False
+
+    async def _amm_try_book_open(self, connector) -> bool:
+        """Book the add that was sent, once what it acquired is known; False while it is not.
+
+        The LP comes from Gateway's answer when it states it (the position is then exact), and
+        otherwise from the growth of the wallet's LP of the pool over the reading before the add.
+        What it paid comes from Gateway's answer, and otherwise from what that LP is worth at the
+        reading taken now, an estimate. The offer is never booked: an AMM deposit takes at most
+        each side, in the pool's ratio, so what was offered is not what was paid.
+        """
+        unbooked = self._amm_unbooked_open
+        pool_address = self.config.pool_address
+        state = self.lp_position_state
+        confirmed = unbooked["kind"] == "unmeasured"
+        pending = (self._amm_pending_amounts(connector, unbooked["order_id"], unbooked["signature"], "add")
+                   if confirmed else {})
+        after, after_read = None, True
+        try:
+            after = await self._read_amm_holding(connector)
+        except Exception as e:
+            after_read = False
+            self.logger().warning(f"Reading the wallet's holding in pool {pool_address} after the AMM add failed: {e}")
+        held_after = self._held_lp(after)
+        lp_before = self._amm_lp_before_open if self._amm_lp_before_open is not None else Decimal("0")
+
+        lp = pending.get("lp")
+        if lp is None and after_read and held_after > lp_before:
+            lp = held_after - lp_before
+        # What this LP is worth at the reading, not the change in the whole holding's worth: the
+        # pool moving between the reads changes the worth of LP the wallet already held.
+        share = self._share_of(after, lp) if lp is not None and held_after > 0 else None
+        base = pending.get("base", share[0] if share else None)
+        quote = pending.get("quote", share[1] if share else None)
+        if lp is None or base is None or quote is None:
+            self.logger().warning(
+                f"The AMM add {unbooked['signature']} on pool {pool_address} is not booked yet: "
+                f"{'the LP it acquired' if lp is None else 'what it paid'} is not stated by Gateway or seen in a "
+                f"reading ({lp_before} LP before the add, {held_after if after_read else 'no reading'} now)."
+            )
+            return False
+        if after is not None:
+            self._current_price = Decimal(str(after.price))
+        current_price = self._current_price or Decimal("0")
+        signature = unbooked["signature"] or "outcome-unknown"
+        order_id = unbooked["order_id"]
+
+        state.position_address = pool_address
+        state.lp_token_amount = lp
+        state.base_amount = state.initial_base_amount = base
+        state.quote_amount = state.initial_quote_amount = quote
+        state.base_fee = state.quote_fee = Decimal("0")
+        state.tx_fee = pending.get("fee", Decimal("0"))
+        state.open_tx_hash = signature
+        state.add_mid_price = current_price
+        state.active_open_order = None
+        # Adopted from a reading after an add whose outcome was never learned.
+        state.open_data_unavailable = not confirmed
+        self._amm_lp_exact = "lp" in pending
+        self._amm_open_estimated = "base" not in pending or "quote" not in pending
+        self._amm_unbooked_open = None
+        if after_read and held_after >= lp:
+            self._position_seen_onchain = True
+        self._reset_slippage()
+        # The close has a retry budget of its own: readings that failed while opening do not spend it.
+        self._current_retries = 0
+        self.logger().info(
+            f"AMM position opened in pool {pool_address}: {lp} LP ({'stated by Gateway' if self._amm_lp_exact else 'measured'}) "
+            f"for base: {base}, quote: {quote} ({'estimated' if self._amm_open_estimated else 'stated by Gateway'})"
+        )
+
+        native_currency = getattr(connector, '_native_currency', DEFAULT_NATIVE_CURRENCY) or DEFAULT_NATIVE_CURRENCY
+        trade_fee = TradeFeeBase.new_spot_fee(
+            fee_schema=connector.trade_fee_schema(),
+            trade_type=TradeType.RANGE,
+            flat_fees=[TokenAmount(amount=state.tx_fee, token=native_currency)]
+        )
+        event = connector._trigger_add_liquidity_event(
+            order_id=order_id,
+            exchange_order_id=signature,
+            trading_pair=self.config.trading_pair,
+            lower_price=Decimal("0"),
+            upper_price=Decimal("0"),
+            amount=base + (quote / current_price if current_price > 0 else Decimal("0")),
+            fee_tier=pool_address,
+            creation_timestamp=self._strategy.current_timestamp,
+            trade_fee=trade_fee,
+            position_address=pool_address,
+            base_amount=base,
+            quote_amount=quote,
+            mid_price=current_price,
+            position_rent=Decimal("0"),
+        )
+        # Recorded unconditionally, for the reason _create_position gives.
+        self._store_lp_event_from_add(event)
+
+        if self._close_after_open:
+            self.logger().info(f"Add resolved after early_stop: removing this position's LP from {pool_address} now.")
+            state.state = LPExecutorStates.CLOSING
+            return True
+        state.update_state(current_price, self._strategy.current_timestamp)
+        return True
+
+    def _amm_hold_unbooked_open(self):
+        """End as an involuntary POSITION_HOLD for an add whose LP was never seen, with the marker.
+
+        Not FAILED: the add confirmed, or may still, and a controller that re-creates an executor
+        after FAILED would deposit a second time beside it.
+        """
+        kind = self._amm_unbooked_open["kind"]
+        self._hold_reason = "open_unmeasured" if kind == "unmeasured" else "open_outcome_unknown"
+        self.lp_position_state.active_open_order = None
+        self._record_unclosed_position_marker()
+        self.close_type = CloseType.POSITION_HOLD
+        self.logger().error(
+            f"The AMM add {self._amm_unbooked_open['signature']} on pool {self.config.pool_address} "
+            f"{'confirmed' if kind == 'unmeasured' else 'may still confirm'}, but its LP was not seen while it was "
+            f"followed (until {self._amm_unbooked_open['follow_until']:.0f}). Terminating as an involuntary "
+            f"POSITION_HOLD (hold_reason={self._hold_reason}) - check the wallet's LP of this pool on-chain before "
+            "trading it. The claim on the pool stays held until it is released by hand."
+        )
+        self.stop()
+
+    async def _amm_update_position_info(self, connector):
+        """Read the pool holding and value this position's LP in it."""
+        try:
+            holding = await self._read_amm_holding(connector)
+        except Exception as e:
+            self.logger().warning(f"Error fetching position info: {e}")
+            return
+        if holding is not None:
+            self._current_price = Decimal(str(holding.price))
+        lp = self._amm_position_lp(self._held_lp(holding))
+        if lp <= 0:
+            # The wallet holds none of this position's LP. The same two gates as a CLMM
+            # position that reads as gone: seen on-chain once, and missing three reads running.
+            self._position_not_found_count += 1
+            if self._position_seen_onchain and self._position_not_found_count >= 3:
+                self.logger().info(
+                    f"The wallet no longer holds this position's LP of pool {self.config.pool_address} "
+                    "(removed externally or by a prior attempt) - marking complete"
+                )
+                if self.close_type is None:
+                    self.close_type = (CloseType.POSITION_HOLD if self.config.keep_position
+                                       else CloseType.EARLY_STOP)
+                self._handle_position_gone()
+            else:
+                self.logger().warning(
+                    f"This position's LP of pool {self.config.pool_address} not found "
+                    f"({self._position_not_found_count} consecutive reads, seen_onchain={self._position_seen_onchain})"
+                )
+            return
+        self._position_not_found_count = 0
+        self._position_seen_onchain = True
+        self._amm_note_limit_reading(self._strategy.current_timestamp, connector)
+        state = self.lp_position_state
+        state.base_amount, state.quote_amount = self._share_of(holding, lp)
+        state.base_fee = state.quote_fee = Decimal("0")
+
+    async def _amm_close_position(self, connector):
+        """Remove this position's LP from the pool: exactly it for an exact position, else by percentage."""
+        if self._hold_reason in ("close_outcome_unknown", "pool_cannot_pay_in_full"):
+            # A remove that may still confirm, or that the pool cannot pay, is never sent again
+            # (see _amm_hold_unclosed and _amm_hold_cannot_pay).
+            return
+        if not self._amm_claim_pool():
+            return
+        async with self._amm_pool_lock():
+            await self._amm_remove(connector)
+
+    async def _amm_remove(self, connector):
+        """Read the wallet's holding in the pool, send the remove, and book it once confirmed."""
+        pool_address = self.config.pool_address
+        state = self.lp_position_state
+        try:
+            before = await self._read_amm_holding(connector)
+        except Exception as e:
+            # The pre-flight is worked out from this reading, so nothing is sent without it.
+            self._handle_close_failure(e)
+            return
+        held = self._held_lp(before)
+        lp = self._amm_position_lp(held)
+        if lp <= 0:
+            # "Is the position still there" is "does the wallet still hold this position's LP".
+            # One miss is never proof, as for a CLMM close.
+            self._position_not_found_count += 1
+            if self._position_not_found_count >= 3:
+                self.logger().info(
+                    f"This position's LP of pool {pool_address} definitively absent "
+                    f"({self._position_not_found_count} consecutive misses) - already removed"
+                )
+                self._handle_position_gone()
+                return
+            self.logger().warning(
+                f"Pre-flight miss {self._position_not_found_count}/3 for this position's LP of pool "
+                f"{pool_address}; not removing this tick"
+            )
+            return
+        self._position_not_found_count = 0
+        self._position_seen_onchain = True
+        state.base_amount, state.quote_amount = self._share_of(before, lp)
+        self._current_price = Decimal(str(before.price))
+
+        # An exact position returns exactly its LP. Otherwise the remove route takes a percentage
+        # of the wallet's LP, rounded down: of the LP Gateway can spend, while this reading counts
+        # confirmed LP, so it takes this position's LP and no more only while nothing else moves
+        # the wallet's LP of the pool (see the section comment). What it leaves of this position's
+        # LP stays in the wallet and is reported as lp_token_residue.
+        exact = self._amm_lp_exact
+        if exact and exact_json_number(state.lp_token_amount) is None:
+            exact = False
+            self.logger().warning(
+                f"This position's {state.lp_token_amount} LP cannot be sent to Gateway as an exact number (more "
+                f"than 2^53-1, or more than 15 significant digits): removing it by percentage instead."
+            )
+        percentage = (lp * Decimal("100") / held).quantize(AMM_PERCENT_QUANTUM, rounding=ROUND_DOWN)
+        if not exact and percentage <= 0:
+            self._handle_close_failure(ValueError(
+                f"This position's {lp} LP is too small a share of the wallet's {held} LP of pool {pool_address} "
+                "to remove by percentage"
+            ))
+            return
+
+        order_id = connector.create_market_order_id(TradeType.RANGE, self.config.trading_pair)
+        state.active_close_order = TrackedOrder(order_id=order_id)
+        proves_dropped = self._proves_dropped(connector)
+        try:
+            # One Gateway request per attempt, as for a CLMM close: this CLOSING loop owns retries.
+            signature = await connector._amm_remove_liquidity(
+                trade_type=TradeType.RANGE,
+                order_id=order_id,
+                trading_pair=self.config.trading_pair,
+                percentage=float(percentage),
+                dex_name=self.lp_dex_name,
+                trading_type=self.lp_trading_type,
+                max_retries=0,
+                pool_address=pool_address,
+                slippage_pct=float(self._slippage_pct),
+                lp_token_amount=state.lp_token_amount if exact else None,
+            )
+        except Exception as e:
+            self._handle_close_failure(e)
+            return
+        if not signature:
+            reason = connector.order_failure_reason(order_id) or "AMM remove liquidity failed"
+            if self._is_outcome_unknown(reason, proves_dropped):
+                state.close_tx_hash = self._amm_order_signature(connector, order_id, reason)
+                self._amm_hold_unclosed(reason)
+            elif AMM_CANNOT_PAY_REFUSAL in reason:
+                self._amm_hold_cannot_pay(reason)
+            else:
+                self._handle_close_failure(ValueError(reason))
+            return
+
+        # Confirmed: from here on nothing may send the remove again, since a second one would take
+        # LP the wallet holds beyond this position. A reading that fails is booked as not measured.
+        pending = self._amm_pending_amounts(connector, order_id, signature, "remove")
+        try:
+            after = await self._read_amm_holding(connector)
+            after_read = True
+        except Exception as e:
+            self.logger().warning(
+                f"Reading the wallet's holding in pool {pool_address} after the AMM remove failed: {e}")
+            after, after_read = None, False
+        removed = pending.get("lp")
+        if removed is None and exact:
+            # Gateway returns exactly the LP it is given, or refuses the remove.
+            removed = state.lp_token_amount
+        if removed is None and after_read:
+            removed = held - self._held_lp(after)
+        if removed is None or removed <= 0:
+            state.close_data_unavailable = True
+            removed = held * percentage / Decimal("100")
+            self.logger().error(
+                f"AMM remove {signature} confirmed, but the LP it removed is not stated or measurable: booking the "
+                f"{removed} LP it asked for. Reported amounts are not measured and PnL is incomplete."
+            )
+        # What the removed LP was worth at the reading before the remove, when Gateway's answer
+        # does not state it: an estimate, since the remove pays at the pool's state when it
+        # executes, which the slippage bound keeps close to that reading.
+        share = self._share_of(before, removed)
+        state.base_amount = pending.get("base", share[0])
+        state.quote_amount = pending.get("quote", share[1])
+        self._amm_close_estimated = "base" not in pending or "quote" not in pending
+        state.base_fee = state.quote_fee = Decimal("0")
+        state.lp_token_residue = (state.lp_token_amount if exact else lp) - removed
+        if state.lp_token_residue > 0:
+            self.logger().warning(
+                f"{state.lp_token_residue} of this position's LP stays in the wallet: the remove took less than "
+                f"the position's LP. The claim on pool {pool_address} stays held until it is released by hand "
+                "(LPExecutor.release_amm_pool_claim): that LP cannot be told apart from LP another AMM executor "
+                "on this pool and wallet would acquire, and its close by percentage would take it."
+            )
+        elif state.lp_token_residue < 0:
+            self.logger().error(
+                f"The remove took {removed} LP of pool {pool_address}, more than this position's {lp}: "
+                "LP the wallet held beyond this position left the pool as well."
+            )
+        close_tx_fee = pending.get("fee", Decimal("0"))
+        state.tx_fee += close_tx_fee
+        state.close_tx_hash = signature
+        self.logger().info(
+            f"AMM position removed from pool {pool_address}: {removed} LP for "
+            f"base: {state.base_amount}, quote: {state.quote_amount}"
+        )
+
+        current_price = self._current_price if self._current_price else Decimal("0")
+        native_currency = getattr(connector, '_native_currency', DEFAULT_NATIVE_CURRENCY) or DEFAULT_NATIVE_CURRENCY
+        trade_fee = TradeFeeBase.new_spot_fee(
+            fee_schema=connector.trade_fee_schema(),
+            trade_type=TradeType.RANGE,
+            flat_fees=[TokenAmount(amount=close_tx_fee, token=native_currency)]
+        )
+        event = connector._trigger_remove_liquidity_event(
+            order_id=order_id,
+            exchange_order_id=signature,
+            trading_pair=self.config.trading_pair,
+            token_id="0",
+            creation_timestamp=self._strategy.current_timestamp,
+            trade_fee=trade_fee,
+            position_address=pool_address,
+            lower_price=Decimal("0"),
+            upper_price=Decimal("0"),
+            mid_price=current_price,
+            base_amount=state.base_amount,
+            quote_amount=state.quote_amount,
+            base_fee=Decimal("0"),
+            quote_fee=Decimal("0"),
+            position_rent_refunded=Decimal("0"),
+        )
+        # The same routing as a CLMM close (see _close_position).
+        if self.close_type == CloseType.POSITION_HOLD:
+            self._store_lp_event_from_remove(event)
+        state.active_close_order = None
+        state.position_address = None
+        if self.close_type == CloseType.EARLY_STOP and abs(self._calculate_net_base_difference()) > Decimal("0.000001"):
+            self._reset_slippage()
+            state.state = LPExecutorStates.SWAPPING
+        else:
+            state.state = LPExecutorStates.COMPLETE
+
+    def _amm_hold_unclosed(self, reason: str):
+        """End as an involuntary POSITION_HOLD after an AMM remove whose outcome is unknown.
+
+        It may still confirm, so it is never sent again: once the first lands, a second remove
+        would take LP the wallet holds beyond this position. The position is recorded as a hold
+        with the unclosed position marker, as a CLMM close whose retries ran out is.
+        """
+        self.lp_position_state.active_close_order = None
+        self._hold_reason = "close_outcome_unknown"
+        self._record_unclosed_position_marker()
+        self.close_type = CloseType.POSITION_HOLD
+        self.logger().error(
+            f"The AMM remove of this position's {self.lp_position_state.lp_token_amount} LP from pool "
+            f"{self.config.pool_address} may still confirm ({reason}). It is not sent again. Terminating as an "
+            "involuntary POSITION_HOLD (hold_reason=close_outcome_unknown) - check the chain, and remove the LP "
+            "by hand if it did not."
+        )
+        self.stop()
+
+    def _amm_hold_cannot_pay(self, reason: str):
+        """End as an involuntary POSITION_HOLD after Gateway refused a remove the pool cannot pay in full.
+
+        The refusal is definite, and the same remove would be refused again, so it is not sent
+        again. The most LP Gateway said can be removed now is reported for whoever removes it.
+        """
+        match = AMM_MOST_REMOVABLE.search(reason)
+        self._amm_most_removable = Decimal(match.group(1)) if match else Decimal("0")
+        self.lp_position_state.active_close_order = None
+        self._hold_reason = "pool_cannot_pay_in_full"
+        self._record_unclosed_position_marker()
+        self.close_type = CloseType.POSITION_HOLD
+        self.logger().error(
+            f"Pool {self.config.pool_address} cannot pay for this position's {self.lp_position_state.lp_token_amount} "
+            f"LP in full; at most {self._amm_most_removable} LP can be removed now ({reason}). It is not sent again. "
+            "Terminating as an involuntary POSITION_HOLD (hold_reason=pool_cannot_pay_in_full)."
+        )
+        self.stop()
+
     def _widen_slippage(self, error: Exception) -> bool:
         """Widen the tolerance for the next attempt, if this failure was slippage.
 
@@ -704,6 +1649,10 @@ class LPExecutor(ExecutorBase):
         # transport failures (e.g. Gateway restarting) would burn the whole retry
         # budget in as many seconds as there are retries.
         if self._strategy.current_timestamp < self._close_backoff_until:
+            return
+
+        if self._is_amm:
+            await self._amm_close_position(connector)
             return
 
         # Verify position still exists before trying to close (handles timeout-but-succeeded
@@ -964,6 +1913,12 @@ class LPExecutor(ExecutorBase):
             "lp_unclosed_position": True,
             "position_address": self.lp_position_state.position_address,
         })
+        if self._is_amm:
+            # The pool address alone does not say how much of the wallet's LP is this position's:
+            # the marker names the pool, the LP (or "unmeasured"), and the transactions.
+            self._held_position_orders[-1].update(self._amm_position_record(),
+                                                  position_address=self.config.pool_address,
+                                                  hold_reason=self._hold_reason)
 
     async def _execute_closeout_swap(self):
         """
@@ -1357,6 +2312,20 @@ class LPExecutor(ExecutorBase):
                 exchange_order_id=f"{self.config.id}-forced-hold",
                 trading_pair=self.config.trading_pair,
             )
+        if self._is_amm and self._amm_lp_at_stake() and not self._amm_marker_written():
+            # An add or remove still being awaited, or LP still in the pool: an AMM share has no
+            # on-chain object of its own to find later, so record what this executor holds, with
+            # its transactions, before the executor is stored.
+            state = self.lp_position_state
+            connector = self.connectors.get(self.config.connector_name)
+            in_flight = state.active_open_order is not None or state.active_close_order is not None
+            if connector is not None and state.active_open_order is not None:
+                state.open_tx_hash = self._amm_order_signature(connector, state.active_open_order.order_id)
+            if connector is not None and state.active_close_order is not None:
+                state.close_tx_hash = self._amm_order_signature(connector, state.active_close_order.order_id)
+            if self._hold_reason is None:
+                self._hold_reason = "forced_stop_in_flight" if in_flight else "forced_stop_lp_in_pool"
+            self._record_unclosed_position_marker()
         if not self._held_position_orders and self.lp_position_state.position_address:
             self.logger().error(
                 f"Forced stop with LP position still on-chain at {self.lp_position_state.position_address} "
@@ -1509,6 +2478,10 @@ class LPExecutor(ExecutorBase):
         Returns 0 when the pool's fee rate is unknown, which is a missing measurement
         rather than an absence of volume. Guessing a rate would put a number here that
         reads as measured and is not.
+
+        An AMM share collects nothing: its fees stay in the reserves, so they are read from
+        the deposit and the share's value now, or at withdrawal (see _amm_fees_earned_quote),
+        and divided by the same fee rate.
         """
         if self._pool_info is None:
             # Pool info not fetched yet — this is read on the very first tick, before
@@ -1531,11 +2504,29 @@ class LPExecutor(ExecutorBase):
 
         price = self._current_price if self._current_price else Decimal("0")
         fees_quote = self.lp_position_state.base_fee * price + self.lp_position_state.quote_fee
+        if self._is_amm:
+            fees_quote = self._amm_fees_earned_quote(price)
         if fees_quote <= 0:
             return Decimal("0")
 
         # fee_pct is a PERCENT on every Gateway surface (see GW-2), not a fraction.
         return fees_quote / (Decimal(str(fee_pct)) / Decimal("100"))
+
+    def _amm_fees_earned_quote(self, price: Decimal) -> Decimal:
+        """The pool fees this AMM share earned, in quote, from its deposit and its value now or at withdrawal.
+
+        Trades move a constant-product share along base x quote = constant, and fees grow that
+        constant, so fees grow L = sqrt(base x quote). A share of L at price p is worth 2 x L x
+        sqrt(p) in quote, so the fees are 2 x sqrt(p) x (L now - L at deposit). 0 when a side
+        is not known.
+        """
+        state = self.lp_position_state
+        sides = (state.initial_base_amount, state.initial_quote_amount, state.base_amount, state.quote_amount)
+        if price <= 0 or min(sides) <= 0:
+            return Decimal("0")
+        grown = ((state.base_amount * state.quote_amount).sqrt()
+                 - (state.initial_base_amount * state.initial_quote_amount).sqrt())
+        return max(Decimal("0"), Decimal("2") * price.sqrt() * grown)
 
     def get_custom_info(self) -> Dict:
         """Report LP position state to controller"""
@@ -1554,7 +2545,7 @@ class LPExecutor(ExecutorBase):
             float(self.lp_position_state.quote_fee)
         )
 
-        return {
+        info = {
             "side": self.config.side,
             "state": self.lp_position_state.state.value,
             "position_address": self.lp_position_state.position_address,
@@ -1602,6 +2593,26 @@ class LPExecutor(ExecutorBase):
             "open_data_unavailable": self.lp_position_state.open_data_unavailable,
             "close_data_unavailable": self.lp_position_state.close_data_unavailable,
         }
+        if self._is_amm:
+            # The pool, this position's LP (or "unmeasured") and its transactions, as the marker has them.
+            # LP amounts stay Decimal: the stored executor writes them out as exact text.
+            record = self._amm_position_record()
+            if record["lp_token_amount"] != "unmeasured":
+                record["lp_token_amount"] = self.lp_position_state.lp_token_amount
+            info.update(record)
+            info.update({
+                "pool_type": "amm",
+                "lp_token_residue": self.lp_position_state.lp_token_residue,
+                "open_outcome_unknown": self._amm_open_outcome_unknown,
+                # True where the amounts were worked out from the wallet's holding in the pool read
+                # around the transaction, not stated by Gateway: estimates, not measurements.
+                "open_amounts_estimated": self._amm_open_estimated,
+                "close_amounts_estimated": self._amm_close_estimated,
+                "largest_removable_lp_token_amount": self._amm_most_removable,
+                "fees_note": "AMM fees accrue inside the pool's reserves and are part of base_amount and "
+                             "quote_amount; there is nothing to collect, so base_fee and quote_fee are always 0.",
+            })
+        return info
 
     # Required abstract methods from ExecutorBase
     async def validate_sufficient_balance(self):

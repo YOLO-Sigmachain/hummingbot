@@ -48,7 +48,10 @@ class LPExecutorConfig(ExecutorConfigBase):
     - connector_name: The network identifier (e.g., "solana-mainnet-beta")
       This is the "connector" that hummingbot connects to.
     - lp_provider: LP provider in format "dex/trading_type" (e.g., "meteora/clmm")
-      Used for pool info, add liquidity, remove liquidity operations.
+      Used for pool info, add liquidity, remove liquidity operations. A trading type of
+      "amm" (e.g., "ergodex/amm") makes the position a share of a constant-product pool:
+      the LP tokens this executor's deposit acquires. It has no price range, so
+      lower_price and upper_price must be left unset; the limit prices still apply.
     - swap_provider: Optional swap provider for close-out swaps when keep_position=False.
       If not provided, uses the network's default swap provider.
     """
@@ -74,9 +77,10 @@ class LPExecutorConfig(ExecutorConfigBase):
     # Trading pair for the pool (required) - e.g., "SOL-USDC"
     trading_pair: str
 
-    # Position price bounds
-    lower_price: Decimal
-    upper_price: Decimal
+    # Position price bounds. Required for a CLMM position; must be left unset (0) for an
+    # AMM pool, whose position has no range.
+    lower_price: Decimal = Decimal("0")
+    upper_price: Decimal = Decimal("0")
 
     # Position amounts
     base_amount: Decimal = Decimal("0")
@@ -141,14 +145,28 @@ class LPExecutorConfig(ExecutorConfigBase):
         require_provider("swap_provider", self.swap_provider, required=False)
         require_non_empty("pool_address", self.pool_address)
         require_trading_pair("trading_pair", self.trading_pair)
-        require_positive("lower_price", self.lower_price)
-        require_lower_than("lower_price", self.lower_price, "upper_price", self.upper_price)
-        # The limit prices close the position once the price leaves the range, so a limit inside
-        # the range would close the position while it is still earning fees.
-        require_positive("upper_limit_price", self.upper_limit_price)
-        require_positive("lower_limit_price", self.lower_limit_price)
-        require_not_above("upper_price", self.upper_price, "upper_limit_price", self.upper_limit_price)
-        require_not_above("lower_limit_price", self.lower_limit_price, "lower_price", self.lower_price)
+        if self.is_amm:
+            # Refused rather than ignored, so a range set here is not taken for one enforced.
+            if self.lower_price != 0 or self.upper_price != 0:
+                raise ValueError(
+                    f"lower_price ({self.lower_price}) and upper_price ({self.upper_price}) must be left unset "
+                    f"for an AMM pool ({self.lp_provider}): its position is a share of the whole pool and has no range"
+                )
+            require_positive("upper_limit_price", self.upper_limit_price)
+            require_positive("lower_limit_price", self.lower_limit_price)
+            require_lower_than("lower_limit_price", self.lower_limit_price, "upper_limit_price", self.upper_limit_price)
+            # An AMM deposit takes at most each side, in the pool's ratio, so it needs both.
+            require_positive("base_amount", self.base_amount)
+            require_positive("quote_amount", self.quote_amount)
+        else:
+            require_positive("lower_price", self.lower_price)
+            require_lower_than("lower_price", self.lower_price, "upper_price", self.upper_price)
+            # The limit prices close the position once the price leaves the range, so a limit inside
+            # the range would close the position while it is still earning fees.
+            require_positive("upper_limit_price", self.upper_limit_price)
+            require_positive("lower_limit_price", self.lower_limit_price)
+            require_not_above("upper_price", self.upper_price, "upper_limit_price", self.upper_limit_price)
+            require_not_above("lower_limit_price", self.lower_limit_price, "lower_price", self.lower_price)
         require_non_negative("base_amount", self.base_amount)
         require_non_negative("quote_amount", self.quote_amount)
         require_positive("position_refresh_interval", self.position_refresh_interval)
@@ -164,6 +182,11 @@ class LPExecutorConfig(ExecutorConfigBase):
             raise ValueError(f"slippage_multiplier must be greater than 1, got {self.slippage_multiplier}")
         return self
 
+    @property
+    def is_amm(self) -> bool:
+        """Whether lp_provider names an AMM (constant-product) pool rather than a CLMM one."""
+        return self.lp_provider.partition("/")[2] == "amm"
+
 
 class LPExecutorState(BaseModel):
     """Tracks a single LP position state within executor."""
@@ -174,6 +197,13 @@ class LPExecutorState(BaseModel):
     quote_amount: Decimal = Decimal("0")
     base_fee: Decimal = Decimal("0")
     quote_fee: Decimal = Decimal("0")
+
+    # False for an AMM pool share, which has no range and so is never out of range.
+    has_price_range: bool = True
+    # AMM only: the LP tokens this position's deposit acquired (0 until measured), and what of
+    # them the close left in the wallet because the remove route takes a percentage.
+    lp_token_amount: Decimal = Decimal("0")
+    lp_token_residue: Decimal = Decimal("0")
 
     # Actual amounts deposited at ADD time (for accurate P&L calculation)
     # Note: base_amount/quote_amount above change as price moves; these are fixed
@@ -255,7 +285,7 @@ class LPExecutorState(BaseModel):
 
         # Position exists - determine state based on price location
         if self.position_address and current_price is not None:
-            if current_price < self.lower_price or current_price > self.upper_price:
+            if self.has_price_range and (current_price < self.lower_price or current_price > self.upper_price):
                 self.state = LPExecutorStates.OUT_OF_RANGE
             else:
                 self.state = LPExecutorStates.IN_RANGE
