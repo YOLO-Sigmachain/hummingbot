@@ -23,6 +23,11 @@ from hummingbot.strategy_v2.executors.gateway_utils import is_slippage_failure, 
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
+from hummingbot.strategy_v2.utils.outcome_hold import (
+    OUTCOME_UNKNOWN_CLOSE_TIMESTAMP,
+    OUTCOME_UNKNOWN_CONNECTOR,
+    OUTCOME_UNKNOWN_ORDER_ID,
+)
 
 
 class OrderExecutor(ExecutorBase):
@@ -44,6 +49,8 @@ class OrderExecutor(ExecutorBase):
         :param update_interval: The interval at which the OrderExecutor should be updated, defaults to 1.0.
         :param max_retries: The maximum number of retries for the OrderExecutor, defaults to 10.
         """
+        if config.max_retries is not None:
+            max_retries = config.max_retries
         super().__init__(strategy=strategy, config=config, connectors=[config.connector_name],
                          update_interval=update_interval, max_retries=max_retries)
         self.config: OrderExecutorConfig = config
@@ -58,6 +65,8 @@ class OrderExecutor(ExecutorBase):
         # order has a price and a book and nothing to be tolerant about. Widens only on a
         # failure Gateway attributed to slippage, never past max_slippage_pct.
         self._slippage_pct: Decimal = config.slippage_pct
+        # The order whose failure said it may have been submitted (SUBMIT_OUTCOME_UNKNOWN).
+        self._outcome_unknown_order_id: Optional[str] = None
 
     # Shutdown ticks (5s apart) tolerated for an order stuck in a state that is
     # neither open nor filled (e.g. the created event never arrived) before the
@@ -249,6 +258,8 @@ class OrderExecutor(ExecutorBase):
             # Straight to the connector, because the strategy's buy/sell carries no
             # place for a slippage tolerance and a Gateway order is a swap against a
             # pool. Same call the LP executor's close-out swap makes.
+            # A named pool is sent only when set, so an order without one is placed as before.
+            pool_kwargs = {"pool_address": self.config.pool_address} if self.config.pool_address else {}
             order_id = connector.place_order(
                 is_buy=self.config.side == TradeType.BUY,
                 trading_pair=self.config.trading_pair,
@@ -256,7 +267,17 @@ class OrderExecutor(ExecutorBase):
                 price=self.get_order_price(),
                 slippage_pct=float(self._slippage_pct),
                 max_retries=self._max_retries,
+                **pool_kwargs,
             )
+        elif self.config.pool_address:
+            # Only a Gateway swap can be pinned to a pool; never place it unpinned.
+            self.logger().error(
+                f"Executor {self.config.id}: pool_address {self.config.pool_address} is set but "
+                f"{self.config.connector_name} is not a Gateway connector; not placing the order."
+            )
+            self.close_type = CloseType.FAILED
+            self.stop()
+            return
         else:
             order_id = self.place_order(
                 connector_name=self.config.connector_name,
@@ -416,7 +437,12 @@ class OrderExecutor(ExecutorBase):
                     f"Order {event.order_id} may have been submitted ({reason}); not retrying. "
                     "Check it on-chain before trading this intent again."
                 )
+                self._outcome_unknown_order_id = event.order_id
                 self._current_retries = self._max_retries + 1
+                self.evaluate_max_retries()
+            elif self.config.max_retries is not None and self._current_retries > self._max_retries:
+                # A budget set in the config is kept exactly: stop now, before the control
+                # loop's next tick places the order once more.
                 self.evaluate_max_retries()
 
     def _widen_slippage_if_that_was_it(self, order_id: str):
@@ -475,7 +501,7 @@ class OrderExecutor(ExecutorBase):
         :return: A dictionary containing custom information.
         """
         connector = self.connectors.get(self.config.connector_name)
-        return {
+        info = {
             "side": self.config.side,
             "level_id": self.config.level_id,
             "current_retries": self._current_retries,
@@ -507,6 +533,14 @@ class OrderExecutor(ExecutorBase):
             "swap_provider": getattr(connector, "swap_provider", None),
             "wallet_address": getattr(connector, "address", None),
         }
+        if self.config.pool_address:
+            info["pool_address"] = self.config.pool_address
+        if self._outcome_unknown_order_id is not None:
+            # Read by ControllerOutcomeHold: the order may still land.
+            info[OUTCOME_UNKNOWN_ORDER_ID] = self._outcome_unknown_order_id
+            info[OUTCOME_UNKNOWN_CONNECTOR] = self.config.connector_name
+            info[OUTCOME_UNKNOWN_CLOSE_TIMESTAMP] = self.close_timestamp
+        return info
 
     def to_format_status(self, scale=1.0):
         """

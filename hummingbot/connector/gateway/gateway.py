@@ -14,7 +14,7 @@ import asyncio
 import re
 import time
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, InvalidOperation, localcontext
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 from pydantic import BaseModel, Field
@@ -45,6 +45,9 @@ from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
 # `binds_price_limit: true` for it in /config/connectors. A stated false never removes one
 # of these: a limit sent to a connector that ignores it costs nothing.
 PRICE_LIMIT_DEXES = frozenset({"ergodex"})
+
+# The id under which Gateway names Ergo's native coin (ERG) in answers (`tokenIn`, `baseTokenAddress`).
+ERGO_NATIVE_TOKEN_ID = "0" * 64
 
 # Gateway's refusal of an AMM deposit or redeem whose pool moved past the request's bound
 # (answered 409, with no code): nothing that can still execute was submitted.
@@ -307,7 +310,8 @@ class Gateway(GatewayBase):
             trading_pair: str,
             is_buy: bool,
             amount: Decimal,
-            slippage_pct: Optional[Decimal] = None
+            slippage_pct: Optional[Decimal] = None,
+            pool_address: Optional[str] = None,
     ) -> Optional[Decimal]:
         """
         Retrieves the volume weighted average price for a swap.
@@ -316,8 +320,53 @@ class Gateway(GatewayBase):
         :param is_buy: True for an intention to buy, False for an intention to sell
         :param amount: The amount required (in base token unit)
         :param slippage_pct: Maximum allowed slippage percentage
+        :param pool_address: Optional pool to quote on (AMM/CLMM). None lets Gateway pick it.
         :return: The quote price.
         """
+        price, _ = await self._quote_price_and_pool(trading_pair, is_buy, amount, slippage_pct, pool_address)
+        return price
+
+    @async_ttl_cache(ttl=5, maxsize=10)
+    async def get_quote_price_and_pool(
+            self,
+            trading_pair: str,
+            is_buy: bool,
+            amount: Decimal,
+            slippage_pct: Optional[Decimal] = None,
+            pool_address: Optional[str] = None,
+    ) -> Tuple[Optional[Decimal], Optional[str]]:
+        """
+        The quote price and the pool Gateway says it priced on (`poolAddress` of its answer).
+
+        The pool is None when Gateway's answer names none. A caller that named a pool can
+        check the answer came from it. The price is None on an error, and when a pool was
+        named and the answer names another one, or its `tokenIn`/`tokenOut` are not the
+        pair's tokens in the side's direction (a pool of another pair).
+        """
+        return await self._quote_price_and_pool(trading_pair, is_buy, amount, slippage_pct, pool_address)
+
+    async def get_quote_price_and_pool_fresh(
+            self,
+            trading_pair: str,
+            is_buy: bool,
+            amount: Decimal,
+            slippage_pct: Optional[Decimal] = None,
+            pool_address: Optional[str] = None,
+    ) -> Tuple[Optional[Decimal], Optional[str]]:
+        """get_quote_price_and_pool without its 5 s cache: Gateway is asked on every call.
+
+        For a re-quote that must see the pool as it is now, such as a sell retried after a failure.
+        """
+        return await self._quote_price_and_pool(trading_pair, is_buy, amount, slippage_pct, pool_address)
+
+    async def _quote_price_and_pool(
+            self,
+            trading_pair: str,
+            is_buy: bool,
+            amount: Decimal,
+            slippage_pct: Optional[Decimal],
+            pool_address: Optional[str],
+    ) -> Tuple[Optional[Decimal], Optional[str]]:
         base, quote = trading_pair.split("-")
         side: TradeType = TradeType.BUY if is_buy else TradeType.SELL
 
@@ -325,6 +374,8 @@ class Gateway(GatewayBase):
             raise ValueError("No swap provider configured for this network. Set swapProvider in Gateway network config.")
 
         dex, trading_type = self._parse_dex_name(self._swap_provider)
+        # Sent only when named, so a quote with no pool is the same request as before.
+        pool_kwargs = {"pool_address": pool_address} if pool_address is not None else {}
 
         try:
             resp: Dict[str, Any] = await self._get_gateway_instance().quote_swap(
@@ -336,10 +387,29 @@ class Gateway(GatewayBase):
                 quote_asset=quote,
                 amount=amount,
                 side=side,
-                slippage_pct=slippage_pct
+                slippage_pct=slippage_pct,
+                **pool_kwargs,
             )
             price = resp.get("price", None)
-            return Decimal(price) if price is not None else None
+            answered_pool = resp.get("poolAddress")
+            answered_pool = answered_pool if isinstance(answered_pool, str) and answered_pool else None
+            if pool_address is not None and answered_pool is not None and answered_pool != pool_address:
+                self.logger().error(
+                    f"Quote for {trading_pair} {side.name} {amount} on pool {pool_address} came from pool "
+                    f"{answered_pool}; ignoring it."
+                )
+                return None, answered_pool
+            if pool_address is not None:
+                # A named pool is priced as it is, whatever pair was asked for, so its tokens
+                # are checked here: a pool of another pair is never priced as this one.
+                mismatch = self._quote_tokens_mismatch(trading_pair, side, resp)
+                if mismatch is not None:
+                    self.logger().error(
+                        f"Quote for {trading_pair} {side.name} {amount} on pool {pool_address}: {mismatch}; "
+                        "ignoring it."
+                    )
+                    return None, answered_pool
+            return (Decimal(price) if price is not None else None), answered_pool
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -348,6 +418,53 @@ class Gateway(GatewayBase):
                 exc_info=True,
                 app_warning_msg=str(e)
             )
+            return None, None
+
+    def _token_address(self, symbol: str) -> Optional[str]:
+        """A token's address (lower case) from Gateway's token list, found as in _token_decimals.
+
+        On Ergo the native coin is the all-zero id when the token list does not carry it.
+        """
+        token = self._token_data.get(symbol)
+        if token is None:
+            matches = [t for s, t in self._token_data.items() if s.lower() == symbol.lower()]
+            token = matches[0] if len(matches) == 1 else None
+        if token is None:
+            token = self.get_token_by_address(symbol)
+        address = token.get("address") if token is not None else None
+        if isinstance(address, str) and address:
+            return address.lower()
+        if (self.chain == "ergo" and self._native_currency is not None
+                and symbol.upper() == self._native_currency.upper()):
+            return ERGO_NATIVE_TOKEN_ID
+        return None
+
+    def pair_token_addresses(self, trading_pair: str) -> Optional[Tuple[str, str]]:
+        """The (base, quote) token addresses of a pair, lower case, or None when either is unknown."""
+        base, quote = trading_pair.split("-")
+        base_address, quote_address = self._token_address(base), self._token_address(quote)
+        if base_address is None or quote_address is None:
+            return None
+        return base_address, quote_address
+
+    def _quote_tokens_mismatch(self, trading_pair: str, side: TradeType, resp: Dict[str, Any]) -> Optional[str]:
+        """Why a quote's `tokenIn`/`tokenOut` are not the pair's in the side's direction, or None when they are.
+
+        A BUY pays the quote token for the base token; a SELL the reverse.
+        """
+        addresses = self.pair_token_addresses(trading_pair)
+        if addresses is None:
+            return f"the token addresses of {trading_pair} are not in the token list"
+        base_address, quote_address = addresses
+        expected_in, expected_out = ((quote_address, base_address) if side == TradeType.BUY
+                                     else (base_address, quote_address))
+        token_in, token_out = resp.get("tokenIn"), resp.get("tokenOut")
+        if not isinstance(token_in, str) or not isinstance(token_out, str) or not token_in or not token_out:
+            return "the answer names no tokenIn/tokenOut"
+        if token_in.lower() != expected_in or token_out.lower() != expected_out:
+            return (f"the answer trades {token_in} for {token_out}, not {expected_in} for {expected_out} "
+                    f"({trading_pair} {side.name})")
+        return None
 
     async def get_order_price(
             self,
@@ -408,7 +525,7 @@ class Gateway(GatewayBase):
         :param trading_pair: The market to place order
         :param amount: The order amount (in base token value)
         :param price: The order price
-        :param kwargs: Additional parameters (dex_name, quote_id, slippage_pct, max_retries)
+        :param kwargs: Additional parameters (dex_name, quote_id, slippage_pct, max_retries, pool_address)
         """
         amount = self.quantize_order_amount(trading_pair, amount)
         price = self.quantize_order_price(trading_pair, price)
@@ -426,6 +543,16 @@ class Gateway(GatewayBase):
                                       trade_type=trade_type,
                                       price=price,
                                       amount=amount)
+
+        # The pool named for this order is kept on it, so a later quote for it uses the same
+        # pool. An order already tracked keeps the pool it was placed with.
+        pool_address: Optional[str] = kwargs.get("pool_address")
+        tracked_order = self._order_tracker.fetch_tracked_order(order_id)
+        if tracked_order is not None:
+            if pool_address is None:
+                pool_address = getattr(tracked_order, "pool_address", None)
+            else:
+                tracked_order.pool_address = pool_address
 
         # A network config that could not be read at start is read again here, so the swap
         # follows its network's rules and provider once Gateway answers.
@@ -483,12 +610,21 @@ class Gateway(GatewayBase):
                         wallet_address=self.address,
                         slippage_pct=slippage_pct,
                         **price_limit,
+                        **({"pool_address": pool_address} if pool_address is not None else {}),
                     )
 
             async def execute_and_keep_pending_data() -> Dict[str, Any]:
                 result = await execute_gateway_swap()
                 self._keep_pending_swap_data(order_id, result)
                 return result
+
+            if quote_id:
+                self.logger().info(f"Swap {order_id}: {trade_type.name} {amount} {trading_pair} on quote {quote_id}.")
+            else:
+                self.logger().info(
+                    f"Swap {order_id}: {trade_type.name} {amount} {trading_pair} via {dex}/{trading_type} on "
+                    + (f"pool {pool_address}." if pool_address is not None else "the pool Gateway chooses.")
+                )
 
             if not self._is_usable_price(price):
                 # A fill confirmed without Gateway's realized amounts is booked at the order's
@@ -511,6 +647,7 @@ class Gateway(GatewayBase):
             )
 
             transaction_hash: Optional[str] = order_result.get("signature")
+            self._log_swap_pool(order_id, pool_address, order_result)
             if transaction_hash is not None and transaction_hash != "":
                 if self._has_no_hash_yet(order_id):
                     self.update_order_from_hash(order_id, trading_pair, transaction_hash, order_result)
@@ -557,6 +694,17 @@ class Gateway(GatewayBase):
         except Exception as e:
             self._fail_swap_order(order_id, trading_pair, trade_type, e)
 
+    def _log_swap_pool(self, order_id: str, pool_address: Optional[str], order_result: Any):
+        """Log the pool Gateway's answer names for a swap (its `data.poolAddress`, once confirmed)."""
+        data = order_result.get("data") if isinstance(order_result, dict) else None
+        used = data.get("poolAddress") if isinstance(data, dict) else None
+        if not isinstance(used, str) or not used:
+            return
+        if pool_address is not None and used != pool_address:
+            self.logger().error(f"Swap {order_id} was placed on pool {pool_address} but Gateway names pool {used}.")
+        else:
+            self.logger().info(f"Swap {order_id} traded on pool {used}.")
+
     def _fail_swap_order(self, order_id: str, trading_pair: str, trade_type: TradeType, error: Exception):
         """Fail the order, unless the order-status loop has already resolved it from the chain."""
         if self._order_tracker.fetch_tracked_order(order_id) is None:
@@ -574,8 +722,14 @@ class Gateway(GatewayBase):
 
     async def _set_quoted_price(self, order_id: str, trading_pair: str, trade_type: TradeType, amount: Decimal):
         """Give an open order placed without a usable price Gateway's quoted price, if Gateway gives one."""
+        tracked = self._order_tracker.fetch_tracked_order(order_id)
+        pool_address = getattr(tracked, "pool_address", None) if tracked is not None else None
         try:
-            quoted = await self.get_quote_price(trading_pair, trade_type == TradeType.BUY, amount)
+            if pool_address is not None:
+                quoted = await self.get_quote_price(trading_pair, trade_type == TradeType.BUY, amount,
+                                                    pool_address=pool_address)
+            else:
+                quoted = await self.get_quote_price(trading_pair, trade_type == TradeType.BUY, amount)
         except asyncio.CancelledError:
             raise
         except Exception as e:

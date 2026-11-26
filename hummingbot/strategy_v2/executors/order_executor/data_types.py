@@ -62,6 +62,11 @@ class OrderExecutorConfig(ExecutorConfigBase):
     slippage_pct: Decimal = Decimal("0.05")
     slippage_multiplier: Decimal = Decimal("5")
     max_slippage_pct: Decimal = Decimal("5")
+    # Gateway AMM/CLMM swaps only: the pool to trade on, kept with the order. None lets
+    # Gateway pick the pool, as before.
+    pool_address: Optional[str] = None
+    # How many times a failed order is placed again. None uses the executor's own budget.
+    max_retries: Optional[int] = None
 
     @model_validator(mode="after")
     def validate_order(self):
@@ -74,6 +79,10 @@ class OrderExecutorConfig(ExecutorConfigBase):
         require_positive("slippage_pct", self.slippage_pct)
         require_positive("max_slippage_pct", self.max_slippage_pct)
         require_not_above("slippage_pct", self.slippage_pct, "max_slippage_pct", self.max_slippage_pct)
+        if self.pool_address is not None:
+            require_non_empty("pool_address", self.pool_address)
+        if self.max_retries is not None and self.max_retries < 0:
+            raise ValueError(f"max_retries must be 0 or more, got {self.max_retries}")
         # A multiplier of 1 or less never widens, which makes max_slippage_pct a promise
         # the ramp cannot keep.
         if self.slippage_multiplier <= 1:

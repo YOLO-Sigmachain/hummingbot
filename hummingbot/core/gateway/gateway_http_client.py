@@ -904,6 +904,7 @@ class GatewayHttpClient:
         slippage_pct: Optional[Decimal] = None,
         chain: Optional[str] = None,
         fail_silently: bool = False,
+        pool_address: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Get a swap quote from the specified DEX via /trading/{router,clmm,amm}/quote-swap.
@@ -918,6 +919,8 @@ class GatewayHttpClient:
         :param slippage_pct: Optional slippage percentage
         :param chain: Chain name (e.g., "solana", "ethereum"); combined with a short network to form the "chain-network" the endpoint requires.
         :param fail_silently: Whether to fail silently on error
+        :param pool_address: Optional, AMM and CLMM routes only: the pool to quote on, sent as
+            `poolAddress`. Not sent when None, so Gateway picks the pool as before.
         :return: Quote response with price, amountIn, amountOut
         """
         if side not in [TradeType.BUY, TradeType.SELL]:
@@ -947,6 +950,7 @@ class GatewayHttpClient:
             amount=amount,
             side=side.name,
             slippagePct=slippage_pct,
+            **self._pool_field(pool_address, trading_type),
         )
 
         return await self.api_request(
@@ -955,6 +959,21 @@ class GatewayHttpClient:
             _query(request),
             fail_silently=fail_silently
         )
+
+    @staticmethod
+    def _pool_field(pool_address: Optional[str], trading_type: str) -> Dict[str, str]:
+        """`poolAddress` for a swap request, or nothing when no pool is named.
+
+        Only the AMM and CLMM routes take a pool; the router route forbids the field, so a
+        pool named there is refused before anything is sent.
+        """
+        if pool_address is None:
+            return {}
+        if trading_type not in ("amm", "clmm"):
+            raise ValueError(f"poolAddress can only be sent on the AMM or CLMM route, not '{trading_type}'")
+        if not isinstance(pool_address, str) or not pool_address.strip():
+            raise ValueError("poolAddress must be a non-empty string")
+        return {"poolAddress": pool_address}
 
     async def get_price(
         self,
@@ -1015,6 +1034,7 @@ class GatewayHttpClient:
         chain: Optional[str] = None,
         min_amount_out: Optional[Decimal] = None,
         max_amount_in: Optional[Decimal] = None,
+        pool_address: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Execute a swap on the specified DEX via /trading/{router,clmm,amm}/execute-swap.
@@ -1033,6 +1053,8 @@ class GatewayHttpClient:
             units, the swap may give. A connector that honours it refuses a swap below it.
         :param max_amount_in: Optional, BUY on the AMM route only: the most quote token, in whole
             units, the swap may take. A connector that honours it refuses a swap above it.
+        :param pool_address: Optional, AMM and CLMM routes only: the pool to trade on, sent as
+            `poolAddress`. Not sent when None, so Gateway picks the pool as before.
         """
         if side not in [TradeType.BUY, TradeType.SELL]:
             raise ValueError("Only BUY and SELL prices are supported.")
@@ -1060,6 +1082,7 @@ class GatewayHttpClient:
             side=side.name,
             slippagePct=slippage_pct,
             walletAddress=wallet_address,
+            **self._pool_field(pool_address, trading_type),
         )
         body = _body(request)
         # Not in the generated models: a stock Gateway's AMM route does not declare these

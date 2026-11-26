@@ -65,6 +65,23 @@ def reset_process_outcome_holds():
     _PROCESS_CLEARED_OUTCOMES.clear()
 
 
+# A controller's halt, by a key its controller picks (for ergo_pool_arb: controller id, connector,
+# pools and pair in upper case) -> {"reason": str or None, "possibly_unhedged": [ {...}, ... ]}. It
+# lives in the process, like the outcome hold, so a strategy stop/start or a rebuilt controller with
+# the same key stays halted and keeps its list. Only a new process clears it.
+_PROCESS_CONTROLLER_HALTS: Dict[str, Dict[str, Any]] = {}
+
+
+def process_controller_halt(key: str) -> Dict[str, Any]:
+    """The halt record for this key, created empty (not halted, nothing listed) when there is none."""
+    return _PROCESS_CONTROLLER_HALTS.setdefault(key, {"reason": None, "possibly_unhedged": []})
+
+
+def reset_process_controller_halts():
+    """Forget every controller halt of this process (for tests)."""
+    _PROCESS_CONTROLLER_HALTS.clear()
+
+
 class ControllerOutcomeHold:
     """The hold for a v2 controller, read from its executors' custom info into a process registry.
 
