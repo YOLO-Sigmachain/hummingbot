@@ -11,6 +11,7 @@ from hummingbot.strategy_v2.executors.arbitrage_executor.data_types import Arbit
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
+from hummingbot.strategy_v2.utils.outcome_hold import ControllerOutcomeHold
 
 
 class ArbitrageControllerConfig(ControllerConfigBase):
@@ -38,6 +39,8 @@ class ArbitrageController(ControllerBase):
         self._len_active_sell_arbitrages = 0
         self.base_asset = self.config.exchange_pair_1.trading_pair.split("-")[0]
         self._gas_token_cache = {}  # Cache for gas tokens by connector
+        # Held after an executor reported an order of unknown outcome (FORK-NOTES section 2.2).
+        self._outcome_hold = ControllerOutcomeHold(self.logger(), controller_id=self.config.id)
         self._initialize_gas_tokens()  # Fetch gas tokens during init
         self.initialize_rate_sources()
 
@@ -107,12 +110,20 @@ class ArbitrageController(ControllerBase):
         """Get the cached gas token for a connector."""
         return self._gas_token_cache.get(connector_name)
 
+    def _connector_names(self) -> List[str]:
+        return [self.config.exchange_pair_1.connector_name, self.config.exchange_pair_2.connector_name]
+
     async def update_processed_data(self):
-        pass
+        connectors = {name: self.market_data_provider.connectors[name] for name in self._connector_names()
+                      if name in self.market_data_provider.connectors}
+        await self._outcome_hold.refresh_due(self.executors_info, connectors, self.market_data_provider.time())
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         self.update_arbitrage_stats()
         executor_actions = []
+        if self._outcome_hold.is_held(self.executors_info, self._connector_names()):
+            # A swap of unknown outcome may still land: no executor in either direction.
+            return executor_actions
         current_time = self.market_data_provider.time()
         if (abs(self._imbalance) >= self.config.max_executors_imbalance or
                 self._last_buy_closed_timestamp + self.config.delay_between_executors > current_time or

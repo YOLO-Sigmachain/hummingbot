@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from decimal import Decimal
-from typing import Dict
+from typing import Dict, Optional
 
 from hummingbot.connector.connector_base import ConnectorBase, Union
 from hummingbot.connector.utils import split_hb_trading_pair
@@ -22,6 +22,15 @@ from hummingbot.strategy_v2.executors.validation import are_tokens_interchangeab
 from hummingbot.strategy_v2.executors.xemm_executor.data_types import XEMMExecutorConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
+from hummingbot.strategy_v2.utils.outcome_hold import (
+    OUTCOME_UNKNOWN_CLOSE_TIMESTAMP,
+    OUTCOME_UNKNOWN_CONNECTOR,
+    OUTCOME_UNKNOWN_ORDER_ID,
+    OUTCOME_UNKNOWN_WAITING_LOG_SECONDS,
+    OUTCOME_UNKNOWN_WAITING_SINCE,
+    SUBMIT_OUTCOME_UNKNOWN,
+    outcome_hold_seconds,
+)
 
 
 class XEMMExecutor(ExecutorBase):
@@ -79,6 +88,14 @@ class XEMMExecutor(ExecutorBase):
         self.maker_order = None
         self.taker_order = None
         self.failed_orders = []
+        # Set when an order failed with SUBMIT_OUTCOME_UNKNOWN: no order is placed again after that.
+        self._outcome_unknown_order_id: Optional[str] = None
+        self._outcome_unknown_connector: Optional[str] = None
+        self._outcome_other_leg: Optional[TrackedOrder] = None
+        self._outcome_other_leg_failed = False
+        # When the order was flagged, and when the executor last logged that it still waits.
+        self._outcome_flagged_at: Optional[float] = None
+        self._outcome_last_waiting_log: Optional[float] = None
         super().__init__(strategy=strategy,
                          connectors=[config.buying_market.connector_name, config.selling_market.connector_name],
                          config=config, update_interval=update_interval, max_retries=max_retries)
@@ -108,7 +125,9 @@ class XEMMExecutor(ExecutorBase):
             self.stop()
 
     async def control_task(self):
-        if self.status == RunnableStatus.RUNNING:
+        if self._outcome_unknown_order_id is not None:
+            self._stop_once_other_leg_done()
+        elif self.status == RunnableStatus.RUNNING:
             await self.update_prices_and_tx_costs()
             await self.control_maker_order()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
@@ -254,6 +273,9 @@ class XEMMExecutor(ExecutorBase):
                                       event_tag: int,
                                       market: ConnectorBase,
                                       event: Union[BuyOrderCompletedEvent, SellOrderCompletedEvent]):
+        if self._outcome_unknown_order_id is not None:
+            # An order's outcome is unknown: no order is placed again.
+            return
         if self.maker_order and event.order_id == self.maker_order.order_id:
             self.logger().info(f"Maker order {event.order_id} completed. Executing taker order.")
             self.place_taker_order()
@@ -269,16 +291,119 @@ class XEMMExecutor(ExecutorBase):
         self.taker_order = TrackedOrder(order_id=taker_order_id)
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
+        if self._outcome_unknown_order_id is not None:
+            # An order's outcome is unknown: no order is placed again.
+            if self._outcome_other_leg is not None and self._outcome_other_leg.order_id == event.order_id:
+                self._outcome_other_leg_failed = True
+                self._stop_once_other_leg_done()
+            return
         if self.maker_order and self.maker_order.order_id == event.order_id:
             self.failed_orders.append(self.maker_order)
-            self.maker_order = None
             self._current_retries += 1
+            if self._flag_if_outcome_unknown(self.maker_connector, event.order_id,
+                                             self.taker_order, self.taker_connector):
+                return
+            self.maker_order = None
         elif self.taker_order and self.taker_order.order_id == event.order_id:
             self.failed_orders.append(self.taker_order)
             self._current_retries += 1
+            if self._flag_if_outcome_unknown(self.taker_connector, event.order_id,
+                                             self.maker_order, self.maker_connector):
+                return
             self.place_taker_order()
 
+    def _flag_if_outcome_unknown(self, connector_name: str, order_id: str,
+                                 other_leg: Optional[TrackedOrder], other_connector: str) -> bool:
+        """Never place an order again when its swap may have reached the chain.
+
+        Gateway has no duplicate guard, so a second order could trade twice. The executor keeps the
+        failed order's id, waits until the other order is done (or stops now if it was never placed),
+        and then ends FAILED. The chain must be checked by hand.
+        """
+        connector = self.connectors.get(connector_name)
+        reason = getattr(connector, "order_failure_reason", lambda _: None)(order_id)
+        if not (isinstance(reason, str) and SUBMIT_OUTCOME_UNKNOWN in reason):
+            return False
+        self._outcome_unknown_order_id = order_id
+        self._outcome_unknown_connector = connector_name
+        self._outcome_other_leg = other_leg
+        self._outcome_flagged_at = self._strategy.current_timestamp
+        if other_leg is None or other_leg.order_id is None:
+            other = "The other order was never placed."
+        else:
+            other = (f"The other order {other_leg.order_id} on {other_connector} is "
+                     f"{'done' if other_leg.is_done else 'still open'}, executed {other_leg.executed_amount_base} "
+                     "base; the executor stops once it is done.")
+        self.logger().error(
+            f"Order {order_id} on {connector_name} may have been submitted ({reason}); not placing it again. "
+            f"{other} The xemm_multiple_levels controller then starts no executor on {connector_name} until "
+            f"the hold window has passed and its balances are refreshed; other callers may not wait. "
+            f"Check order {order_id} on chain."
+        )
+        self._stop_once_other_leg_done()
+        return True
+
+    def _other_leg_done(self) -> bool:
+        other = self._outcome_other_leg
+        return other is None or other.order_id is None or self._outcome_other_leg_failed or other.is_done
+
+    def _stop_once_other_leg_done(self):
+        """After an unknown outcome: end FAILED once the other order is done, never re-placing either."""
+        if self.status == RunnableStatus.TERMINATED:
+            return
+        if not self._other_leg_done():
+            self._log_still_waiting()
+            return
+        other = self._outcome_other_leg
+        if other is not None and other.order_id is not None:
+            self.logger().error(
+                f"Order {self._outcome_unknown_order_id} has an unknown outcome; the other order {other.order_id} "
+                f"is done with {other.executed_amount_base} base executed. Stopping the executor."
+            )
+        self.close_type = CloseType.FAILED
+        self.stop()
+
+    def _log_still_waiting(self):
+        """Past the hold window with the other order still not done: log an error at most every 600 s.
+
+        The executor is not stopped: a stop would start the controller's window while the other
+        order's state is still unknown.
+        """
+        now = self._strategy.current_timestamp
+        flagged_at = self._outcome_flagged_at
+        if not all(isinstance(t, (int, float)) and not isinstance(t, bool) for t in (now, flagged_at)):
+            return
+        if now < flagged_at + outcome_hold_seconds(self.connectors.get(self._outcome_unknown_connector)):
+            return
+        last = self._outcome_last_waiting_log
+        if last is not None and now - last < OUTCOME_UNKNOWN_WAITING_LOG_SECONDS:
+            return
+        self._outcome_last_waiting_log = now
+        other = self._outcome_other_leg
+        state = other.order.current_state if other.order is not None else "never acknowledged"
+        self.logger().error(
+            f"Order {self._outcome_unknown_order_id} has an unknown outcome and the other order {other.order_id} "
+            f"is still not done (state {state}, executed {other.executed_amount_base} base) after the hold "
+            "window. The controller stays held until this executor is stopped by hand after the chain is "
+            "checked."
+        )
+
     def get_custom_info(self) -> Dict:
+        info = self._base_custom_info()
+        if self._outcome_unknown_order_id is not None:
+            other = self._outcome_other_leg
+            info.update({
+                OUTCOME_UNKNOWN_ORDER_ID: self._outcome_unknown_order_id,
+                OUTCOME_UNKNOWN_CONNECTOR: self._outcome_unknown_connector,
+                OUTCOME_UNKNOWN_CLOSE_TIMESTAMP: self.close_timestamp,
+                "outcome_unknown_other_order_id": other.order_id if other is not None else None,
+                "outcome_unknown_other_executed_base": (other.executed_amount_base if other is not None
+                                                        else Decimal("0")),
+                OUTCOME_UNKNOWN_WAITING_SINCE: self._outcome_flagged_at,
+            })
+        return info
+
+    def _base_custom_info(self) -> Dict:
         # Since we can't make this method async, we'll skip the profitability calculation
         # The profitability will still be shown in the status message which is async
         return {

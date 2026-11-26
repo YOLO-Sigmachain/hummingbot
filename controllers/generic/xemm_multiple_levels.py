@@ -12,6 +12,7 @@ from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, C
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.xemm_executor.data_types import XEMMExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
+from hummingbot.strategy_v2.utils.outcome_hold import ControllerOutcomeHold
 
 
 class XEMMMultipleLevelsConfig(ControllerConfigBase):
@@ -73,6 +74,8 @@ class XEMMMultipleLevels(ControllerBase):
         self.sell_levels_targets_amount = config.sell_levels_targets_amount
         super().__init__(config, *args, **kwargs)
         self._gas_token_cache = {}
+        # Held after an executor reported an order of unknown outcome (FORK-NOTES section 2.2).
+        self._outcome_hold = ControllerOutcomeHold(self.logger(), controller_id=self.config.id)
         self._initialize_gas_tokens()
         self.initialize_rate_sources()
 
@@ -140,11 +143,19 @@ class XEMMMultipleLevels(ControllerBase):
         """Get the cached gas token for a connector."""
         return self._gas_token_cache.get(connector_name)
 
+    def _connector_names(self) -> List[str]:
+        return [self.config.maker_connector, self.config.taker_connector]
+
     async def update_processed_data(self):
-        pass
+        connectors = {name: self.market_data_provider.connectors[name] for name in self._connector_names()
+                      if name in self.market_data_provider.connectors}
+        await self._outcome_hold.refresh_due(self.executors_info, connectors, self.market_data_provider.time())
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         executor_actions = []
+        if self._outcome_hold.is_held(self.executors_info, self._connector_names()):
+            # A swap of unknown outcome may still land: no executor at any level.
+            return executor_actions
         mid_price = self.market_data_provider.get_price_by_type(self.config.maker_connector, self.config.maker_trading_pair, PriceType.MidPrice)
         active_buy_executors = self.filter_executors(
             executors=self.executors_info,

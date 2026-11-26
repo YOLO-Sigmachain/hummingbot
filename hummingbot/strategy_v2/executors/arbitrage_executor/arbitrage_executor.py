@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from decimal import Decimal
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
@@ -14,6 +14,17 @@ from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.executors.validation import are_tokens_interchangeable
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
+from hummingbot.strategy_v2.utils.outcome_hold import (
+    OUTCOME_UNKNOWN_CLOSE_TIMESTAMP,
+    OUTCOME_UNKNOWN_CONNECTOR,
+    OUTCOME_UNKNOWN_ORDER_ID,
+    OUTCOME_UNKNOWN_OTHER_CONNECTOR,
+    OUTCOME_UNKNOWN_OTHER_ORDER_ID,
+    OUTCOME_UNKNOWN_WAITING_LOG_SECONDS,
+    OUTCOME_UNKNOWN_WAITING_SINCE,
+    SUBMIT_OUTCOME_UNKNOWN,
+    outcome_hold_seconds,
+)
 
 
 class ArbitrageExecutor(ExecutorBase):
@@ -66,6 +77,17 @@ class ArbitrageExecutor(ExecutorBase):
         self.quote_conversion_pair = f"{sell_quote_asset}-{buy_quote_asset}"
         self.rate_oracle = RateOracle.get_instance()
         self._cumulative_failures = 0
+        # Set when a leg failed with SUBMIT_OUTCOME_UNKNOWN: no leg is placed again after that.
+        self._outcome_unknown_order_id: Optional[str] = None
+        self._outcome_unknown_connector: Optional[str] = None
+        self._outcome_other_leg: Optional[TrackedOrder] = None
+        self._outcome_other_connector: Optional[str] = None
+        self._outcome_other_leg_failed = False
+        # Set when the other leg also failed with SUBMIT_OUTCOME_UNKNOWN: both swaps may land.
+        self._outcome_unknown_other_connector: Optional[str] = None
+        # When the leg was flagged, and when the executor last logged that it still waits.
+        self._outcome_flagged_at: Optional[float] = None
+        self._outcome_last_waiting_log: Optional[float] = None
 
     async def validate_sufficient_balance(self):
         base_asset_for_selling_exchange = self.connectors[self.selling_market.connector_name].get_available_balance(
@@ -151,7 +173,9 @@ class ArbitrageExecutor(ExecutorBase):
             except Exception as e:
                 self.logger().error(f"Error calculating profitability: {e}")
         elif self.status == RunnableStatus.SHUTTING_DOWN:
-            if self._cumulative_failures > self._max_retries:
+            if self._outcome_unknown_order_id is not None:
+                self._stop_once_other_leg_done()
+            elif self._cumulative_failures > self._max_retries:
                 self.close_type = CloseType.FAILED
                 self.stop()
             else:
@@ -289,14 +313,134 @@ class ArbitrageExecutor(ExecutorBase):
             self.sell_order.order = self.get_in_flight_order(self.selling_market.connector_name, event.order_id)
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
+        if self._outcome_unknown_order_id is not None:
+            # A leg's outcome is unknown: neither leg is placed again.
+            if self._outcome_other_leg is not None and self._outcome_other_leg.order_id == event.order_id:
+                self._outcome_other_leg_failed = True
+                other_connector = self._outcome_other_connector
+                connector = self.connectors.get(other_connector)
+                reason = getattr(connector, "order_failure_reason", lambda _: None)(event.order_id)
+                if isinstance(reason, str) and SUBMIT_OUTCOME_UNKNOWN in reason:
+                    self._outcome_unknown_other_connector = other_connector
+                    self.logger().error(
+                        f"The other leg {event.order_id} on {other_connector} also failed with an unknown "
+                        f"outcome ({reason}); both swaps may still land. Check both on chain."
+                    )
+                self._stop_once_other_leg_done()
+            return
         if self.buy_order.order_id == event.order_id:
+            self._cumulative_failures += 1
+            if self._flag_if_outcome_unknown(self.buying_market.connector_name, event.order_id,
+                                             self.sell_order, self.selling_market.connector_name):
+                return
             self.place_buy_arbitrage_order()
-            self._cumulative_failures += 1
         elif self.sell_order.order_id == event.order_id:
-            self.place_sell_arbitrage_order()
             self._cumulative_failures += 1
+            if self._flag_if_outcome_unknown(self.selling_market.connector_name, event.order_id,
+                                             self.buy_order, self.buying_market.connector_name):
+                return
+            self.place_sell_arbitrage_order()
+
+    def _flag_if_outcome_unknown(self, connector_name: str, order_id: str,
+                                 other_leg: TrackedOrder, other_connector: str) -> bool:
+        """Never place a leg again when its swap may have reached the chain.
+
+        Gateway has no duplicate guard, so a second order could trade twice. The executor keeps the
+        failed order's id, waits until the other leg is done (or stops now if it was never placed),
+        and then ends FAILED. The chain must be checked by hand.
+        """
+        connector = self.connectors.get(connector_name)
+        reason = getattr(connector, "order_failure_reason", lambda _: None)(order_id)
+        if not (isinstance(reason, str) and SUBMIT_OUTCOME_UNKNOWN in reason):
+            return False
+        self._outcome_unknown_order_id = order_id
+        self._outcome_unknown_connector = connector_name
+        self._outcome_other_leg = other_leg
+        self._outcome_other_connector = other_connector
+        self._outcome_flagged_at = self._strategy.current_timestamp
+        if other_leg.order_id is None:
+            other = "The other leg was never placed."
+        else:
+            other = (f"The other leg {other_leg.order_id} on {other_connector} is "
+                     f"{'done' if other_leg.is_done else 'still open'}, executed {other_leg.executed_amount_base} "
+                     "base; the executor stops once it is done.")
+        self.logger().error(
+            f"Order {order_id} on {connector_name} may have been submitted ({reason}); not placing it again. "
+            f"{other} The arbitrage controller then starts no executor on {connector_name} until the hold "
+            f"window has passed and its balances are refreshed; other callers may not wait. "
+            f"Check order {order_id} on chain."
+        )
+        self._stop_once_other_leg_done()
+        return True
+
+    def _other_leg_done(self) -> bool:
+        other = self._outcome_other_leg
+        return other is None or other.order_id is None or self._outcome_other_leg_failed or other.is_done
+
+    def _stop_once_other_leg_done(self):
+        """After an unknown outcome: end FAILED once the other leg is done, never re-placing either leg."""
+        if self.status == RunnableStatus.TERMINATED:
+            return
+        if not self._other_leg_done():
+            self._log_still_waiting()
+            return
+        other = self._outcome_other_leg
+        if self._outcome_unknown_other_connector is not None:
+            self.logger().error(
+                f"Order {self._outcome_unknown_order_id} and the other leg {other.order_id} both have an "
+                "unknown outcome; both swaps may land. Stopping the executor."
+            )
+        elif other is not None and other.order_id is not None:
+            self.logger().error(
+                f"Order {self._outcome_unknown_order_id} has an unknown outcome; the other leg {other.order_id} "
+                f"is done with {other.executed_amount_base} base executed. Stopping the executor."
+            )
+        self.close_type = CloseType.FAILED
+        self.stop()
+
+    def _log_still_waiting(self):
+        """Past the hold window with the other leg still not done: log an error at most every 600 s.
+
+        The executor is not stopped: a stop would start the controller's window while the other
+        leg's state is still unknown.
+        """
+        now = self._strategy.current_timestamp
+        flagged_at = self._outcome_flagged_at
+        if not all(isinstance(t, (int, float)) and not isinstance(t, bool) for t in (now, flagged_at)):
+            return
+        if now < flagged_at + outcome_hold_seconds(self.connectors.get(self._outcome_unknown_connector)):
+            return
+        last = self._outcome_last_waiting_log
+        if last is not None and now - last < OUTCOME_UNKNOWN_WAITING_LOG_SECONDS:
+            return
+        self._outcome_last_waiting_log = now
+        other = self._outcome_other_leg
+        state = other.order.current_state if other.order is not None else "never acknowledged"
+        self.logger().error(
+            f"Order {self._outcome_unknown_order_id} has an unknown outcome and the other leg {other.order_id} "
+            f"is still not done (state {state}, executed {other.executed_amount_base} base) after the hold "
+            "window. The controller stays held until this executor is stopped by hand after the chain is "
+            "checked."
+        )
 
     def get_custom_info(self) -> Dict:
+        info = self._base_custom_info()
+        if self._outcome_unknown_order_id is not None:
+            other = self._outcome_other_leg
+            info.update({
+                OUTCOME_UNKNOWN_ORDER_ID: self._outcome_unknown_order_id,
+                OUTCOME_UNKNOWN_CONNECTOR: self._outcome_unknown_connector,
+                OUTCOME_UNKNOWN_CLOSE_TIMESTAMP: self.close_timestamp,
+                OUTCOME_UNKNOWN_OTHER_ORDER_ID: other.order_id if other is not None else None,
+                "outcome_unknown_other_executed_base": (other.executed_amount_base if other is not None
+                                                        else Decimal("0")),
+                OUTCOME_UNKNOWN_WAITING_SINCE: self._outcome_flagged_at,
+            })
+            if self._outcome_unknown_other_connector is not None:
+                info[OUTCOME_UNKNOWN_OTHER_CONNECTOR] = self._outcome_unknown_other_connector
+        return info
+
+    def _base_custom_info(self) -> Dict:
         return {
             "buy_connector": self.buying_market.connector_name,
             "sell_connector": self.selling_market.connector_name,

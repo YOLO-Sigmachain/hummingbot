@@ -354,3 +354,95 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.executor.quote_conversion_pair = "USDC-USDT"
         with self.assertRaises(Exception):
             await self.executor.get_quote_asset_conversion_rate()
+
+    def _reason(self, connector_name: str, reason: str):
+        self.executor.connectors[connector_name].order_failure_reason = MagicMock(return_value=reason)
+
+    @staticmethod
+    def _done_order(executed: str) -> MagicMock:
+        order = MagicMock()
+        order.is_done = True
+        order.executed_amount_base = Decimal(executed)
+        return order
+
+    def test_taker_failed_with_unknown_outcome_is_not_placed_again(self):
+        self._reason("kucoin", "TimeoutError() [code: SUBMIT_OUTCOME_UNKNOWN]")
+        self.executor._status = RunnableStatus.SHUTTING_DOWN
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        self.executor.maker_order.order = self._done_order("100")
+        self.executor.taker_order = TrackedOrder(order_id="OID-SELL-0")
+        event = MarketOrderFailureEvent(timestamp=1234, order_id="OID-SELL-0", order_type=OrderType.MARKET)
+        self.executor.process_order_failed_event(1, MagicMock(), event)
+        self.strategy.sell.assert_not_called()
+        self.assertEqual("OID-SELL-0", self.executor.taker_order.order_id)
+        self.assertEqual(CloseType.FAILED, self.executor.close_type)
+        self.assertEqual(RunnableStatus.TERMINATED, self.executor.status)
+        self.assertTrue(self.is_partially_logged("ERROR", "Order OID-SELL-0 on kucoin may have been submitted"))
+        info = self.executor.get_custom_info()
+        self.assertEqual("OID-SELL-0", info["outcome_unknown_order_id"])
+        self.assertEqual("kucoin", info["outcome_unknown_connector"])
+        self.assertEqual("OID-BUY-1", info["outcome_unknown_other_order_id"])
+        self.assertEqual(Decimal("100"), info["outcome_unknown_other_executed_base"])
+        self.assertIn("outcome_unknown_close_timestamp", info)
+
+    async def test_taker_failed_with_unknown_outcome_waits_for_an_open_maker(self):
+        self._reason("kucoin", "TimeoutError() [code: SUBMIT_OUTCOME_UNKNOWN]")
+        self.executor._status = RunnableStatus.SHUTTING_DOWN
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        self.executor.taker_order = TrackedOrder(order_id="OID-SELL-0")
+        event = MarketOrderFailureEvent(timestamp=1234, order_id="OID-SELL-0", order_type=OrderType.MARKET)
+        self.executor.process_order_failed_event(1, MagicMock(), event)
+        await self.executor.control_task()
+        self.assertEqual(RunnableStatus.SHUTTING_DOWN, self.executor.status)
+
+        # A maker completion now places no taker order.
+        self.executor.process_order_completed_event(1, MagicMock(), BuyOrderCompletedEvent(
+            timestamp=1234, order_id="OID-BUY-1", base_asset="ETH", quote_asset="USDT",
+            base_asset_amount=Decimal("100"), quote_asset_amount=Decimal("100"), order_type=OrderType.LIMIT))
+        self.strategy.sell.assert_not_called()
+
+        self.executor.maker_order.order = self._done_order("100")
+        await self.executor.control_task()
+        self.strategy.buy.assert_not_called()
+        self.strategy.sell.assert_not_called()
+        self.assertEqual(CloseType.FAILED, self.executor.close_type)
+        self.assertEqual(RunnableStatus.TERMINATED, self.executor.status)
+
+    def test_maker_failed_with_unknown_outcome_stops_and_stays_tracked(self):
+        self._reason("binance", "ClientError() [code: SUBMIT_OUTCOME_UNKNOWN]")
+        self.executor._status = RunnableStatus.RUNNING
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        event = MarketOrderFailureEvent(timestamp=1234, order_id="OID-BUY-1", order_type=OrderType.LIMIT)
+        self.executor.process_order_failed_event(1, MagicMock(), event)
+        self.assertEqual("OID-BUY-1", self.executor.maker_order.order_id)
+        self.assertEqual(CloseType.FAILED, self.executor.close_type)
+        self.assertEqual(RunnableStatus.TERMINATED, self.executor.status)
+        self.assertTrue(self.is_partially_logged("ERROR", "The other order was never placed"))
+        self.assertEqual("binance", self.executor.get_custom_info()["outcome_unknown_connector"])
+
+    def test_taker_failed_with_definite_reason_is_placed_again(self):
+        self._reason("kucoin", "Gateway error 409 [code: SLIPPAGE_EXCEEDED]")
+        self.executor._status = RunnableStatus.SHUTTING_DOWN
+        self.executor.taker_order = TrackedOrder(order_id="OID-SELL-0")
+        event = MarketOrderFailureEvent(timestamp=1234, order_id="OID-SELL-0", order_type=OrderType.MARKET)
+        self.executor.process_order_failed_event(1, MagicMock(), event)
+        self.assertEqual("OID-SELL-1", self.executor.taker_order.order_id)
+        self.assertIsNone(self.executor.close_type)
+        self.assertEqual(RunnableStatus.SHUTTING_DOWN, self.executor.status)
+
+    async def test_open_maker_after_the_window_logs_an_error_and_keeps_waiting(self):
+        self._reason("kucoin", "TimeoutError() [code: SUBMIT_OUTCOME_UNKNOWN]")
+        self.executor.connectors["kucoin"]._block_time_seconds = 120.0
+        self.executor.connectors["kucoin"]._block_confirmations = 1
+        self.strategy.current_timestamp = 1000.0
+        self.executor._status = RunnableStatus.SHUTTING_DOWN
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        self.executor.taker_order = TrackedOrder(order_id="OID-SELL-0")
+        event = MarketOrderFailureEvent(timestamp=1234, order_id="OID-SELL-0", order_type=OrderType.MARKET)
+        self.executor.process_order_failed_event(1, MagicMock(), event)
+        self.assertEqual(1000.0, self.executor.get_custom_info()["outcome_unknown_waiting_since"])
+
+        self.strategy.current_timestamp = 1000.0 + 1320
+        await self.executor.control_task()
+        self.assertTrue(self.is_partially_logged("ERROR", "the other order OID-BUY-1 is still not done"))
+        self.assertEqual(RunnableStatus.SHUTTING_DOWN, self.executor.status)
