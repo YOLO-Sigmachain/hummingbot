@@ -10,6 +10,8 @@ Hummingbot is an open-source framework that helps you design and deploy automate
 
 The Hummingbot codebase is free and publicly available under the Apache 2.0 open-source license. Our mission is to **democratize high-frequency trading** by creating a global community of algorithmic traders and developers that share knowledge and contribute to the codebase.
 
+> **This is a fork.** Branch `feat/ergo` is Hummingbot v2.18.0 plus what is needed to trade on **Ergo** through the [Gateway fork](https://github.com/YOLO-Sigmachain/gateway/tree/feat/ergo): tracking of swaps on a chain with 2-minute blocks, the `ergodex` connector (Spectrum-style and LithosDex pools), a two-pool arbitrage controller, and a **NonKYC** spot connector. [FORK-NOTES.md](./FORK-NOTES.md) says what changed, which upstream files are touched, and what has and has not been proven. The connectors this fork adds are listed under [Connectors added by this fork](#connectors-added-by-this-fork). The rest of this file is the upstream README.
+
 ## Quick Links
 
 * [Website and Docs](https://hummingbot.org): Official Hummingbot website and documentation
@@ -192,6 +194,17 @@ Currently, the master branch of Hummingbot also includes the following exchange 
 | [Raydium](https://hummingbot.org/exchanges/gateway/raydium/) | AMM DEX | AMM, CLMM | `raydium` | - |
 | [Titan](https://hummingbot.org/exchanges/gateway/jupiter/#other-solana-routers) | AMM DEX | Router | `titan` | - |
 | [Uniswap](https://hummingbot.org/exchanges/gateway/uniswap/) | AMM DEX | Router, AMM, CLMM | `uniswap` | - |
+
+### Connectors added by this fork
+
+These are not part of upstream Hummingbot and are not maintained through its governance process. See [FORK-NOTES.md](./FORK-NOTES.md).
+
+| Exchange | Type | Sub-Type(s) | Connector ID(s) | Notes |
+|------|------|------|-------|----------|
+| Ergo AMM pools (Spectrum-style and LithosDex) | AMM DEX | AMM | `ergodex` | Through the [Gateway fork](https://github.com/YOLO-Sigmachain/gateway/tree/feat/ergo), chain `ergo`. Swaps on both kinds of pool; liquidity on Spectrum-style pools only. |
+| NonKYC | CLOB CEX | Spot | `nonkyc` | Ported from `NonKYCExchange/hummingbot` and repaired (FORK-NOTES section 2.4). Not yet run with an API key. |
+
+Strategy code added for Ergo: the controller [`ergo_pool_arb.py`](./controllers/generic/ergo_pool_arb.py), which arbitrages two Ergo pools of one pair; an AMM mode for the LP executor (FORK-NOTES section 2.1); and guards in `amm_arb`, the arbitrage executor and the XEMM executor so that a swap whose outcome is unknown is never placed a second time (FORK-NOTES sections 2.2 to 2.4).
 
 ## Other Hummingbot Repos
 
