@@ -375,3 +375,29 @@ class NonkycOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase, LoggerMixin
         methods = [p["method"] for p in self.sent_payloads()]
         self.assertEqual([CONSTANTS.WS_METHOD_UNSUBSCRIBE_TRADES, CONSTANTS.WS_METHOD_UNSUBSCRIBE_ORDERBOOK], methods)
         self.assertNotIn(msgs.TRADING_PAIR, self.data_source._trading_pairs)
+
+    async def test_snapshot_superseding_all_held_diffs_clears_pending_state_and_timer(self):
+        # When a fresh snapshot covers every buffered out-of-order diff, _pending_diffs becomes
+        # empty and both _pending_since and the armed release timer must be cleared so no
+        # spurious timeout resync fires on subsequent healthy diffs.
+        ds = self.data_source
+        self.route(CONSTANTS.SNAPSHOT_EVENT_TYPE, 100)
+        self.assertEqual([101], self.diffs(101))
+        self.assertEqual([], self.diffs(103))  # held out-of-order diff
+        self.assertIn(msgs.SYMBOL, ds._pending_diffs)
+        self.assertIn(msgs.SYMBOL, ds._pending_since)
+        timer = ds._release_timers.get(msgs.SYMBOL)
+        self.assertIsNotNone(timer)
+
+        self.route(CONSTANTS.SNAPSHOT_EVENT_TYPE, 105)
+        self.assertNotIn(msgs.SYMBOL, ds._pending_diffs)
+        self.assertNotIn(msgs.SYMBOL, ds._pending_since)
+        self.assertNotIn(msgs.SYMBOL, ds._release_timers)
+        self.assertTrue(timer.cancelled())
+
+        # Advancing past the reorder window and receiving healthy diffs must not trigger a resync.
+        self.now += CONSTANTS.BOOK_REORDER_WINDOW_SECONDS + 1
+        self.assertEqual([106], self.diffs(106))
+        await self.settle()
+        self.assertEqual([], self.sent_payloads())
+        self.assertFalse(any(r.levelname == "WARNING" for r in self.log_records))
