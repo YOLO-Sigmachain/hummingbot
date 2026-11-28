@@ -423,11 +423,10 @@ class AmmArbStrategy(StrategyPyBase):
                         self.log_with_clock(logging.ERROR,
                                             f"Order {order_id} seems to have failed in this arbitrage opportunity. "
                                             f"Dropping Arbitrage Proposal. ")
-                        is_held = order_id in self._outcome_holds
-                        if is_second_leg and (not is_held or not self.is_gateway_market(arb_side.market_info)):
-                            # The first leg traded. A definite failure, or a non-Gateway leg of unknown
-                            # outcome: held as well, but the hold ending must not resume trading while
-                            # the first leg may be unhedged.
+                        if is_second_leg:
+                            # The first leg traded. A definite failure or an unknown outcome on the second
+                            # leg leaves the first leg unhedged: even when an outcome hold also starts, its
+                            # expiry must not resume trading.
                             self._halt_unhedged(arb_proposal, arb_side, order_id, self._failure_wording(order_id))
                         return
 
@@ -704,35 +703,41 @@ class AmmArbStrategy(StrategyPyBase):
             arb_side.set_failed()
             arb_side.set_completed()
 
+    def _resolve_completed_order_market_info(self, order_id: str) -> Optional[MarketTradingPairTuple]:
+        market_info = self.order_tracker.get_market_pair_from_order_id(order_id)
+        if market_info is None:
+            arb_side = self._order_id_side_map.get(order_id)
+            if arb_side is not None:
+                market_info = arb_side.market_info
+        return market_info
+
     def did_complete_buy_order(self, order_completed_event: BuyOrderCompletedEvent):
         self._settle_outcome_hold(order_completed_event.order_id, "filled")
         self.set_order_completed(order_id=order_completed_event.order_id)
 
-        market_info: MarketTradingPairTuple = self.order_tracker.get_market_pair_from_order_id(
-            order_completed_event.order_id
-        )
-        log_msg: str = f"Buy order completed on {market_info.market.name}: {order_completed_event.order_id}."
-        if self.is_gateway_market(market_info):
+        market_info = self._resolve_completed_order_market_info(order_completed_event.order_id)
+        market_name = market_info.market.name if market_info is not None else "unknown market"
+        log_msg: str = f"Buy order completed on {market_name}: {order_completed_event.order_id}."
+        if market_info is not None and self.is_gateway_market(market_info):
             log_msg += f" txHash: {order_completed_event.exchange_order_id}"
         self.log_with_clock(logging.INFO, log_msg)
         self.notify_hb_app_with_timestamp(f"Bought {order_completed_event.base_asset_amount:.8f} "
                                           f"{order_completed_event.base_asset}-{order_completed_event.quote_asset} "
-                                          f"on {market_info.market.name}.")
+                                          f"on {market_name}.")
 
     def did_complete_sell_order(self, order_completed_event: SellOrderCompletedEvent):
         self._settle_outcome_hold(order_completed_event.order_id, "filled")
         self.set_order_completed(order_id=order_completed_event.order_id)
 
-        market_info: MarketTradingPairTuple = self.order_tracker.get_market_pair_from_order_id(
-            order_completed_event.order_id
-        )
-        log_msg: str = f"Sell order completed on {market_info.market.name}: {order_completed_event.order_id}."
-        if self.is_gateway_market(market_info):
+        market_info = self._resolve_completed_order_market_info(order_completed_event.order_id)
+        market_name = market_info.market.name if market_info is not None else "unknown market"
+        log_msg: str = f"Sell order completed on {market_name}: {order_completed_event.order_id}."
+        if market_info is not None and self.is_gateway_market(market_info):
             log_msg += f" txHash: {order_completed_event.exchange_order_id}"
         self.log_with_clock(logging.INFO, log_msg)
         self.notify_hb_app_with_timestamp(f"Sold {order_completed_event.base_asset_amount:.8f} "
                                           f"{order_completed_event.base_asset}-{order_completed_event.quote_asset} "
-                                          f"on {market_info.market.name}.")
+                                          f"on {market_name}.")
 
     def did_fail_order(self, order_failed_event: MarketOrderFailureEvent):
         order_id = order_failed_event.order_id

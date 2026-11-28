@@ -993,6 +993,8 @@ class LPExecutor(ExecutorBase):
             signature = state.open_tx_hash
             stated = (self._amm_pending_amounts(connector, order_id, signature, "add").get("lp")
                       if connector is not None and order_id and signature else None)
+            if stated is None:
+                stated = (unbooked.get("pending") or {}).get("lp")
             record["stated_lp_token_amount"] = str(stated) if stated is not None else None
             if signature is None and self._amm_open_outcome_unknown is not None:
                 record["open_tx_note"] = (
@@ -1095,10 +1097,13 @@ class LPExecutor(ExecutorBase):
                 "transaction's status when its id is known and by the wallet's LP of the pool, and then this "
                 "executor holds with the unclosed-position marker."
             )
+        pending = (self._amm_pending_amounts(connector, order_id, signature, "add")
+                   if signature else {})
         self.lp_position_state.active_open_order = None
         self.lp_position_state.open_tx_hash = signature
         self._amm_unbooked_open = {"kind": kind, "order_id": order_id, "signature": signature,
-                                   "reads_left": self.AMM_OPEN_REREADS, "follow_until": follow_until}
+                                   "pending": pending, "reads_left": self.AMM_OPEN_REREADS,
+                                   "follow_until": follow_until}
         await self._amm_book_or_wait(connector)
 
     def _amm_open_follow_until(self, connector, sent_at: float) -> float:
@@ -1185,8 +1190,10 @@ class LPExecutor(ExecutorBase):
         pool_address = self.config.pool_address
         state = self.lp_position_state
         confirmed = unbooked["kind"] == "unmeasured"
-        pending = (self._amm_pending_amounts(connector, unbooked["order_id"], unbooked["signature"], "add")
-                   if confirmed else {})
+        pending = {}
+        if confirmed:
+            pending = (self._amm_pending_amounts(connector, unbooked["order_id"], unbooked["signature"], "add")
+                       or unbooked.get("pending") or {})
         after, after_read = None, True
         try:
             after = await self._read_amm_holding(connector)
@@ -1379,10 +1386,10 @@ class LPExecutor(ExecutorBase):
         # the wallet's LP of the pool (see the section comment). What it leaves of this position's
         # LP stays in the wallet and is reported as lp_token_residue.
         exact = self._amm_lp_exact
-        if exact and exact_json_number(state.lp_token_amount) is None:
+        if exact and exact_json_number(lp) is None:
             exact = False
             self.logger().warning(
-                f"This position's {state.lp_token_amount} LP cannot be sent to Gateway as an exact number (more "
+                f"This position's {lp} LP cannot be sent to Gateway as an exact number (more "
                 f"than 2^53-1, or more than 15 significant digits): removing it by percentage instead."
             )
         percentage = (lp * Decimal("100") / held).quantize(AMM_PERCENT_QUANTUM, rounding=ROUND_DOWN)
@@ -1408,7 +1415,7 @@ class LPExecutor(ExecutorBase):
                 max_retries=0,
                 pool_address=pool_address,
                 slippage_pct=float(self._slippage_pct),
-                lp_token_amount=state.lp_token_amount if exact else None,
+                lp_token_amount=lp if exact else None,
             )
         except Exception as e:
             self._handle_close_failure(e)
@@ -1437,7 +1444,7 @@ class LPExecutor(ExecutorBase):
         removed = pending.get("lp")
         if removed is None and exact:
             # Gateway returns exactly the LP it is given, or refuses the remove.
-            removed = state.lp_token_amount
+            removed = lp
         if removed is None and after_read:
             removed = held - self._held_lp(after)
         if removed is None or removed <= 0:
@@ -1455,7 +1462,7 @@ class LPExecutor(ExecutorBase):
         state.quote_amount = pending.get("quote", share[1])
         self._amm_close_estimated = "base" not in pending or "quote" not in pending
         state.base_fee = state.quote_fee = Decimal("0")
-        state.lp_token_residue = (state.lp_token_amount if exact else lp) - removed
+        state.lp_token_residue = lp - removed
         if state.lp_token_residue > 0:
             self.logger().warning(
                 f"{state.lp_token_residue} of this position's LP stays in the wallet: the remove took less than "

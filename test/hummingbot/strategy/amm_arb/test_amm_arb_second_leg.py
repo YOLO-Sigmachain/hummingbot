@@ -304,3 +304,66 @@ class AmmArbSecondLegTest(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertEqual([], self.cancelled)
         self.assertFalse(self.strategy._halted)
         self.cex.create_request_sent.assert_called_with("OID-2")
+
+    async def test_unknown_outcome_on_gateway_second_leg_also_halts(self):
+        # DEX-to-DEX sequential arb: leg 1 filled on Gateway #1, leg 2 on Gateway #2 fails with
+        # SUBMIT_OUTCOME_UNKNOWN. An outcome hold starts, and the strategy must also halt so the
+        # hold expiring does not resume trading while leg 1 is unhedged.
+        gw2 = MagicMock()
+        gw2.name = "ergo-mainnet-2"
+        gw2.display_name = "ergo-mainnet-2"
+        gw2._block_time_seconds = 120.0
+        gw2._block_confirmations = 1
+        reasons = {}
+        self.gateway.order_failure_reason = MagicMock(side_effect=lambda oid: reasons.get(oid))
+        gw2.order_failure_reason = MagicMock(side_effect=lambda oid: reasons.get(oid))
+        gw2.get_balance = MagicMock(return_value=Decimal("100"))
+        gw2._update_balances = AsyncMock()
+        info_2 = MarketTradingPairTuple(gw2, "ERG-USDT", "ERG", "USDT")
+
+        with patch("hummingbot.strategy.amm_arb.amm_arb.AllConnectorSettings.get_gateway_amm_connector_names",
+                   return_value={"ergo-mainnet", "ergo-mainnet-2"}):
+            AmmArbStrategy.is_gateway_market.cache_clear()
+            strategy = AmmArbStrategy()
+            strategy.init_params(
+                market_info_1=self.info_1,
+                market_info_2=info_2,
+                min_profitability=Decimal("0.01"),
+                order_amount=Decimal("1"),
+                concurrent_orders_submission=False,
+                rate_source=MagicMock(),
+            )
+            self.set_loggers([strategy.logger()])
+            proposal = ArbProposal(
+                ArbProposalSide(self.info_1, False, Decimal("0.19"), Decimal("0.19"), Decimal("1"), []),
+                ArbProposalSide(info_2, True, Decimal("0.1888"), Decimal("0.1888"), Decimal("1"), []),
+            )
+
+            async def place(market_info, is_buy, amount, price):
+                order_id = f"OID-{len(self.placed) + 1}"
+                self.placed.append((market_info.market.name, order_id))
+                loop = asyncio.get_event_loop()
+                if len(self.placed) == 1:
+                    loop.call_soon(strategy.set_order_completed, order_id)
+                else:
+                    reasons[order_id] = UNKNOWN
+                    loop.call_soon(strategy.did_fail_order,
+                                   MarketOrderFailureEvent(self.now, order_id, OrderType.MARKET))
+                return order_id
+
+            with patch.object(strategy, "place_arb_order", side_effect=place):
+                await asyncio.wait_for(strategy.execute_arb_proposals([proposal]), timeout=2.0)
+
+            self.assertIn("OID-2", strategy._outcome_holds)
+            self.assertTrue(strategy._halted)
+            self.assertEqual(1, len(self.halt_messages()))
+            self.assertIn("OID-2 (", self.halt_messages()[0])
+            self.assertIn("failed with an unknown outcome and may still fill",
+                          self.halt_messages()[0])
+
+            # Expiry of the outcome hold must not resume trading while halted.
+            self.now += 7200
+            create = AsyncMock(return_value=[])
+            with patch("hummingbot.strategy.amm_arb.amm_arb.create_arb_proposals", create):
+                await strategy.main()
+            create.assert_not_awaited()
