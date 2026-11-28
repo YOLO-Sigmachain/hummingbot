@@ -224,6 +224,8 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if pending:
             for held in [s for s in pending if s <= sequence]:
                 del pending[held]
+            if not pending:
+                self._clear_pending(symbol)
         return self._drain(symbol)
 
     def _sequence_diff(self, symbol: str, params: Dict[str, Any], message: Dict[str, Any],
@@ -274,6 +276,8 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         pending = self._pending_diffs.get(symbol)
         out: List[Dict[str, Any]] = []
         if not pending:
+            if symbol in self._pending_diffs or symbol in self._pending_since or symbol in self._release_timers:
+                self._clear_pending(symbol)
             return out
         last = self._last_sequence[symbol]
         while last + 1 in pending:
