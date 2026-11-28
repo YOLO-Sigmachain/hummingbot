@@ -979,6 +979,61 @@ class TestAMMOutcomeUnknown(AMMPoolShareTestBase):
         self.assertNotIn("open_tx_note", marker)
         self.assertEqual(Decimal("50"), Decimal(executor.get_custom_info()["lp_before_open"]))
 
+    async def test_an_unknown_add_keeps_its_stated_amounts_after_gateway_evicts_the_order_cache(self):
+        executor = self.an_unresolved_add_on_120s_blocks()
+        await self.open(executor)
+        # Simulate Gateway evicting the failed TX_UNRESOLVED order from its short TTL cache.
+        self.pending.clear()
+        self.connector.get_order.side_effect = lambda order_id: None
+        for _ in range(10):
+            await self.next_refresh(executor)
+        self.assertEqual(LPExecutorStates.OPENING, executor.lp_position_state.state)
+
+        self.pool.deposit(Decimal("10"), Decimal("20"))
+        self.tx_status = {"txStatus": 1}
+        await self.next_refresh(executor)
+
+        state = executor.lp_position_state
+        self.assertEqual(POOL, state.position_address)
+        self.assertEqual(Decimal("10"), state.lp_token_amount)
+        self.assertEqual(Decimal("9.5"), state.initial_base_amount)
+        self.assertEqual(Decimal("19"), state.initial_quote_amount)
+        self.assertEqual(Decimal("0.0011"), state.tx_fee)
+        info = executor.get_custom_info()
+        self.assertTrue(info["lp_token_amount_exact"])
+        self.assertFalse(info["open_amounts_estimated"])
+
+    async def test_the_marker_keeps_stated_lp_after_gateway_evicts_the_order_cache(self):
+        self.pool = FakePool(wallet_lp=Decimal("50"))
+        self.add_failure = f"Transaction {SIGNATURE} still unresolved after 720s of polling [code: TX_UNRESOLVED]"
+        self.pending["range-1"] = (SIGNATURE, {"poolAddress": POOL, "lpTokenAmountAdded": "10"})
+        executor = self.an_executor()
+        await self.open(executor)
+        self.pending.clear()
+        self.connector.get_order.side_effect = lambda order_id: None
+        await self.run_rereads(executor)
+
+        marker = executor._held_position_orders[-1]
+        self.assertEqual(Decimal("10"), Decimal(marker["stated_lp_token_amount"]))
+
+    async def test_an_exact_remove_clamps_to_held_lp_after_external_shortfall(self):
+        self.gateway_states_amounts = True
+        executor = self.an_executor(upper_limit_price=None)
+        await self.open(executor)
+        self.assertEqual(Decimal("10"), executor.lp_position_state.lp_token_amount)
+        self.assertTrue(executor._amm_lp_exact)
+
+        # 4 LP left the wallet outside this executor; 6 remain.
+        self.pool.redeem(Decimal("4"))
+        executor.early_stop(keep_position=True)
+        await executor.control_task()
+
+        state = executor.lp_position_state
+        self.assertEqual(LPExecutorStates.COMPLETE, state.state)
+        self.assertEqual(Decimal("6"), self.connector._amm_remove_liquidity.call_args.kwargs["lp_token_amount"])
+        self.assertEqual(Decimal("0"), state.lp_token_residue)
+        self.assertEqual(Decimal("0"), self.pool.wallet_lp)
+
     async def test_the_marker_of_an_add_whose_reply_was_lost_says_its_transaction_id_is_unknown(self):
         self.pool = FakePool(wallet_lp=Decimal("50"))
         self.add_failure = "ClientPayloadError() [code: SUBMIT_OUTCOME_UNKNOWN]"

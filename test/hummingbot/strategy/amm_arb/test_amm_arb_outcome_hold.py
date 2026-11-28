@@ -5,7 +5,7 @@ from test.logger_mixin_for_test import LoggerMixinForTest
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from hummingbot.core.data_type.common import OrderType
-from hummingbot.core.event.events import MarketOrderFailureEvent, SellOrderCompletedEvent
+from hummingbot.core.event.events import BuyOrderCompletedEvent, MarketOrderFailureEvent, SellOrderCompletedEvent
 from hummingbot.strategy.amm_arb import amm_arb
 from hummingbot.strategy.amm_arb.amm_arb import AmmArbStrategy
 from hummingbot.strategy.amm_arb.data_types import ArbProposal, ArbProposalSide
@@ -347,3 +347,29 @@ class AmmArbOutcomeHoldTest(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
 
         self.gateway.address = "9fWalletA"
         self.assertIn("OID-1", self.new_strategy()._outcome_holds)
+
+    async def test_late_completion_after_order_tracker_eviction_does_not_crash(self):
+        # After did_fail_order, StrategyBase.order_tracker no longer tracks the order id and
+        # get_market_pair_from_order_id returns None. Late buy/sell completion must fall back
+        # to _order_id_side_map (and tolerate missing side entries too) without AttributeError.
+        await self.hold_after_unknown_failure()
+        self.now = T0 + 60
+
+        tracker = MagicMock()
+        tracker.get_market_pair_from_order_id.return_value = None
+        with patch.object(AmmArbStrategy, "order_tracker", new_callable=PropertyMock, return_value=tracker):
+            self.strategy.did_complete_sell_order(SellOrderCompletedEvent(
+                self.now, "OID-1", "ERG", "USDT", Decimal("1"), Decimal("2"), OrderType.MARKET,
+                exchange_order_id="0xtx1"))
+            self.strategy.did_complete_buy_order(BuyOrderCompletedEvent(
+                self.now, "OID-UNKNOWN", "ERG", "USDT", Decimal("1"), Decimal("2"), OrderType.MARKET,
+                exchange_order_id="0xtx2"))
+
+        self.assertTrue(self.is_partially_logged(
+            "INFO", "Sell order completed on ergo-mainnet: OID-1. txHash: 0xtx1"))
+        self.assertTrue(self.is_partially_logged(
+            "INFO", "Buy order completed on unknown market: OID-UNKNOWN."))
+        create = AsyncMock(return_value=[])
+        await self.run_main(create)
+        self.gateway._update_balances.assert_awaited_once()
+        create.assert_awaited_once()
