@@ -559,11 +559,13 @@ class NonkycExchange(ExchangePyBase):
             raise NonkycResponseError(f"NonKYC did not confirm the cancel of {order_id}: {cancel_result}")
 
         # Book fills that landed before the cancel, before the order is marked CANCELED
+        trades_fetched = True
         try:
             await self._fetch_and_process_order_trades(tracked_order)
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            trades_fetched = False
             self.logger().warning(f"Could not fetch trades of cancelled order {order_id}: {error}")
         if tracked_order.is_filled:
             return False
@@ -576,8 +578,10 @@ class NonkycExchange(ExchangePyBase):
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            self.logger().warning(f"Could not re-read cancelled order {order_id}: {error}")
-            return not tracked_order.is_filled
+            self.logger().warning(
+                f"Could not re-read cancelled order {order_id}: {error}. "
+                f"Deferring cancellation to status poll.")
+            return False
         executed = to_decimal(order_data.get("executedQuantity")) or s_decimal_0
         if executed > tracked_order.executed_amount_base:
             self.logger().warning(
@@ -585,6 +589,11 @@ class NonkycExchange(ExchangePyBase):
                 f"{tracked_order.executed_amount_base} is booked from trades. Not marked cancelled until the "
                 f"trades are listed.")
             self._order_tracker.process_order_update(order_update)
+            return False
+        if not trades_fetched:
+            self.logger().warning(
+                f"NonKYC confirmed the cancel of {order_id}, but its trades could not be fetched. "
+                f"Deferring cancellation to status poll.")
             return False
         return not tracked_order.is_filled
 

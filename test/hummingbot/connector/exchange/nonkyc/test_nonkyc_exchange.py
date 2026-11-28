@@ -32,8 +32,8 @@ from hummingbot.core.event.events import MarketEvent
 from hummingbot.logger import NETWORK
 
 BASE = "https://api.nonkyc.io/api/v2"
-API_KEY = "KEY-abc123def456"
-SECRET = "SECRET-xyz789uvw000"
+API_KEY = "KEY-test-01"
+SECRET = "SEC-test-01"
 NOW = 1795727600.0
 # getorder by NonKYC id once known, by client id before
 BY_ID = f"{CONSTANTS.ORDER_INFO_PATH_URL}/{msgs.EXCHANGE_ORDER_ID}"
@@ -268,6 +268,8 @@ class NonkycExchangeTests(IsolatedAsyncioWrapperTestCase):
             # cancel: by exchange id; fills checked before CANCELED
             replay.post(CONSTANTS.CANCEL_ORDER_PATH_URL, {"success": True, "id": msgs.EXCHANGE_ORDER_ID})
             replay.get(CONSTANTS.USER_TRADES_PATH_URL, [t2, t1])
+            replay.get(BY_ID,
+                       msgs.order_record("HBOT-B1", executed="6", status="Cancelled", is_active=False))
             result = await self.exchange._execute_cancel(msgs.TRADING_PAIR, "HBOT-B1")
             await self.settle()
 
@@ -808,11 +810,63 @@ class NonkycExchangeTests(IsolatedAsyncioWrapperTestCase):
             replay.get(BY_CLIENT_ID, msgs.order_record("HBOT-B1"))
             replay.post(CONSTANTS.CANCEL_ORDER_PATH_URL, {"success": True, "id": msgs.EXCHANGE_ORDER_ID})
             replay.get(CONSTANTS.USER_TRADES_PATH_URL, [])
+            replay.get(BY_ID,
+                       msgs.order_record("HBOT-B1", executed="0", status="Cancelled", is_active=False))
             await self.exchange._execute_cancel(msgs.TRADING_PAIR, "HBOT-B1")
             await self.settle()
         self.assertEqual({"id": msgs.EXCHANGE_ORDER_ID},
                          json.loads(replay.sent("POST", CONSTANTS.CANCEL_ORDER_PATH_URL)[0]["data"]))
         self.assertEqual(OrderState.CANCELED, order.current_state)
+
+    async def test_confirmed_cancel_defers_when_order_reread_fails(self):
+        # If re-reading the order after a confirmed cancel fails (e.g. 503/429/timeout),
+        # do not mark CANCELED immediately: keep the order tracked so status polling can
+        # verify executedQuantity and book any late fills.
+        with aioresponses() as mock_api:
+            replay = Replay(mock_api)
+            order = await self.place(replay)
+            replay.post(CONSTANTS.CANCEL_ORDER_PATH_URL, {"success": True, "id": msgs.EXCHANGE_ORDER_ID})
+            replay.get(CONSTANTS.USER_TRADES_PATH_URL, [])
+            replay.get(BY_ID, status=503, body="Service Unavailable")
+            result = await self.exchange._execute_cancel(msgs.TRADING_PAIR, "HBOT-B1")
+            await self.settle()
+            self.assertIsNone(result)
+            self.assertEqual(0, self.event_count(MarketEvent.OrderCancelled))
+            self.assertNotEqual(OrderState.CANCELED, order.current_state)
+            self.assertIn("HBOT-B1", self.exchange.in_flight_orders)
+
+            # Next poll sees the order actually filled before cancel took effect.
+            replay.get(CONSTANTS.USER_TRADES_PATH_URL, [msgs.trade_record("T1", "10")])
+            replay.get(BY_ID, msgs.order_record("HBOT-B1", executed="10", status="Filled", is_active=False))
+            self.exchange._set_current_timestamp(NOW + 5)
+            await self.poll()
+        self.assertEqual(OrderState.FILLED, order.current_state)
+        self.assertEqual(Decimal("10"), order.executed_amount_base)
+        self.assertEqual(1, self.event_count(MarketEvent.BuyOrderCompleted))
+        self.assertEqual(0, self.event_count(MarketEvent.OrderCancelled))
+
+    async def test_confirmed_cancel_defers_when_trade_fetch_fails(self):
+        # If fetching order trades after a confirmed cancel fails, defer cancellation to
+        # status polling rather than marking CANCELED with unverified fills.
+        with aioresponses() as mock_api:
+            replay = Replay(mock_api)
+            order = await self.place(replay)
+            replay.post(CONSTANTS.CANCEL_ORDER_PATH_URL, {"success": True, "id": msgs.EXCHANGE_ORDER_ID})
+            replay.get(CONSTANTS.USER_TRADES_PATH_URL, status=503, body="Service Unavailable")
+            replay.get(BY_ID, msgs.order_record("HBOT-B1", executed="0", status="Cancelled", is_active=False))
+            result = await self.exchange._execute_cancel(msgs.TRADING_PAIR, "HBOT-B1")
+            await self.settle()
+            self.assertIsNone(result)
+            self.assertEqual(0, self.event_count(MarketEvent.OrderCancelled))
+            self.assertNotEqual(OrderState.CANCELED, order.current_state)
+
+            # Next poll succeeds and applies CANCELED cleanly.
+            replay.get(CONSTANTS.USER_TRADES_PATH_URL, [])
+            replay.get(BY_ID, msgs.order_record("HBOT-B1", executed="0", status="Cancelled", is_active=False))
+            self.exchange._set_current_timestamp(NOW + 5)
+            await self.poll()
+        self.assertEqual(OrderState.CANCELED, order.current_state)
+        self.assertEqual(1, self.event_count(MarketEvent.OrderCancelled))
 
     async def test_unconfirmed_cancel_is_not_treated_as_cancelled(self):
         # MP-M2: success false raises and the order stays open; not counted as not found
